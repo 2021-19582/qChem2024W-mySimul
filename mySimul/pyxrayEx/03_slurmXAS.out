@@ -1,0 +1,48 @@
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+ 
+:: initializing oneAPI environment ...
+   bash: BASH_VERSION = 5.0.17(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: advisor -- latest
+:: ccl -- latest
+:: compiler -- latest
+:: dal -- latest
+:: debugger -- latest
+:: dev-utilities -- latest
+:: dnnl -- latest
+:: dpcpp-ct -- latest
+:: dpl -- latest
+:: inspector -- latest
+:: ipp -- latest
+:: ippcp -- latest
+:: itac -- latest
+:: mkl -- latest
+:: mpi -- latest
+:: tbb -- latest
+:: vtune -- latest
+:: oneAPI environment initialized ::
+ 
+------------------------ /usr/share/modules/modulefiles ------------------------
+dot  module-git  module-info  modules  null  use.own  
+ERROR: Unable to locate a modulefile for 'jmol-16.1.47'
+------------------------ /usr/share/modules/modulefiles ------------------------
+dot  module-git  module-info  modules  null  use.own  
+ERROR: Unable to locate a modulefile for 'jmol-16.1.47'
+/home/amychoi7/programs/anaconda/envs/pyscf
+/home/amychoi7/programs/pyscf/pyscf/dft/libxc.py:772: UserWarning: Since PySCF-2.3, B3LYP (and B3P86) are changed to the VWN-RPA variant, corresponding to the original definition by Stephens et al. (issue 1480) and the same as the B3LYP functional in Gaussian. To restore the VWN5 definition, you can put the setting "B3LYP_WITH_VWN5 = True" in pyscf_conf.py
+  warnings.warn('Since PySCF-2.3, B3LYP (and B3P86) are changed to the VWN-RPA variant, '
+Traceback (most recent call last):
+  File "03_FeSdi_xas.py", line 120, in <module>
+    n_threads=n_threads, clean_scratch=False, verbose=verbose
+  File "/home/amychoi7/programs/pyxray_preview/pyxray/solver/block/core.py", line 46, in __init__
+    fp_codec_cutoff=fp_codec_cutoff,
+  File "/home/amychoi7/programs/block2-preview/pyblock2/driver/core.py", line 366, in __init__
+    self.symm_type = symm_type
+  File "/home/amychoi7/programs/block2-preview/pyblock2/driver/core.py", line 391, in symm_type
+    self.set_symm_type(symm_type)
+  File "/home/amychoi7/programs/block2-preview/pyblock2/driver/core.py", line 589, in set_symm_type
+    self.bw = Block2Wrapper(symm_type)
+  File "/home/amychoi7/programs/block2-preview/pyblock2/driver/core.py", line 166, in __init__
+    import block2 as b
+ImportError: /opt/intel/oneapi/mkl/2024.0/lib/libmkl_gnu_thread.so.2: undefined symbol: mkl_blas_xgemm_f16f16f32_pack

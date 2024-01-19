@@ -1,0 +1,34 @@
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+ 
+:: initializing oneAPI environment ...
+   bash: BASH_VERSION = 5.0.17(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: advisor -- latest
+:: ccl -- latest
+:: compiler -- latest
+:: dal -- latest
+:: debugger -- latest
+:: dev-utilities -- latest
+:: dnnl -- latest
+:: dpcpp-ct -- latest
+:: dpl -- latest
+:: inspector -- latest
+:: ipp -- latest
+:: ippcp -- latest
+:: itac -- latest
+:: mkl -- latest
+:: mpi -- latest
+:: tbb -- latest
+:: vtune -- latest
+:: oneAPI environment initialized ::
+ 
+/home/amychoi7/programs/anaconda/envs/pyscf
+ERROR: Unable to locate a modulefile for 'pyscf'
+No Modulefiles Currently Loaded.
+/home/amychoi7/programs/pyscf/pyscf/dft/libxc.py:772: UserWarning: Since PySCF-2.3, B3LYP (and B3P86) are changed to the VWN-RPA variant, corresponding to the original definition by Stephens et al. (issue 1480) and the same as the B3LYP functional in Gaussian. To restore the VWN5 definition, you can put the setting "B3LYP_WITH_VWN5 = True" in pyscf_conf.py
+  warnings.warn('Since PySCF-2.3, B3LYP (and B3P86) are changed to the VWN-RPA variant, '
+Traceback (most recent call last):
+  File "00000_defaultMain.py", line 106, in <module>
+    tools.molden.from_mo(mol, myMOLDENfile)
+TypeError: from_mo() missing 1 required positional argument: 'mo_coeff'

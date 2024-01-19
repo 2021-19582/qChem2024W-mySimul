@@ -1,0 +1,382 @@
+#INFO: **** input file is /home/amychoi7/github_qChem2024/Adiabatic_State_Preparation/1_FCIDUMP/1_FCIDUMP_final/mySimul/pyxrayEx/01_fecl4_xas.py ****
+#    PyXray: a library for ab-initio X-ray spectrum simulation
+#    Copyright (C) 2023  Seunghoon Lee <seunghoonlee89@gmail.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+'''
+An example to run L-edge XAS spectrum calculation. 
+'''
+
+#==================================================================
+# 0. Initial Settings for Ledge XAS 
+#==================================================================
+# parameters for calculation
+model = 'feII_8o12e_lunoloc'
+#model = 'feIII_8o11e_lunoloc'
+method = 'casci'
+somf = True 
+dip_elems = ['x', 'y', 'z'] 
+
+# parameters for system
+scratch = './nodex_%s' % model
+save_dir = './nodex_%s_save' % model # save mps for gs and cv
+n_threads = 28
+verbose = 2 # 0: quite, 1: minimal, >1: debug
+dbg = True
+
+# parameters for GS DMRG calculation
+n_sweeps_gs = 20 
+bond_dims_gs = [500] * 20 
+noises_gs = [1e-4] * 4 + [1e-5] * 4 + [0]
+thrds_gs = [1e-6] * 8
+
+# parameters for DDMRG calculation
+n_sweeps_cps = 8
+bond_dims_cps = [500] * n_sweeps_cps 
+thrds_cps = [1e-10] * n_sweeps_cps
+
+n_sweeps_cv = 20 
+bond_dims_cv = [500] * n_sweeps_cv 
+noises_cv = [1e-4] * (n_sweeps_cv - 14) + [0.] * 6 
+thrds_cv = [1e-4] * n_sweeps_cv
+
+# parameters for XAS
+import numpy as np
+from pyscf.data import nist
+HARTREE2EV = nist.HARTREE2EV  
+freqs_gap = 0.1
+freq_min = 705
+freq_max = 735
+freqs = np.arange(freq_min, freq_max + 1e-5, freqs_gap)
+freqs /= HARTREE2EV
+etas = np.array([0.3] * len(freqs)) / HARTREE2EV
+
+#==================================================================
+# 1. Generate Active Space Model 
+#==================================================================
+# 1-1] Define molecule
+from pyxray.model import fecl4
+m_fecl4 = fecl4.ActiveSpaceModel(model)
+mol = m_fecl4.gen_mol()
+
+# 1-2] Generate orbitals
+import os
+dumpfile = '%s.h5' % model
+if not os.path.isfile(dumpfile):
+    # 1-2-1] UKS orbital optimization 
+    dumpfile_mf = '%s_uks.h5' % model
+    mf = m_fecl4.do_mf(mol, chkfile=dumpfile_mf)
+    
+    # 1-2-2] localization of nat orbs using spin averaged UKS density 
+    from pyxray.utils.lunoloc import dumpLUNO
+    lmo, enorb, occ = dumpLUNO(mol, mf.mo_coeff, mf.mo_energy, thresh=0.05, 
+                               dumpname=dumpfile, dbg=dbg)
+    if dbg:
+        from pyscf.tools import molden
+        with open('lunoloc.molden','w') as thefile:
+            molden.header(mol, thefile)
+            molden.orbital_coeff(mol, thefile, lmo, ene=enorb, occ=occ)
+    
+# 1-3] Generate active space model and Hamiltonian 
+m_fecl4.init_model(dumpfile, method=method, dbg=dbg)
+h1e, g2e, ecore = m_fecl4.gen_ham(tol=1e-6)
+hso, hso2e = m_fecl4.gen_hso(somf=somf) # hso2e is None if somf is True
+hr = m_fecl4.gen_hr()
+
+n_mo, n_elec, n_core = m_fecl4.norb, m_fecl4.n_elec, m_fecl4.n_core
+n_core, n_inactive, n_external, n_active = m_fecl4.n_core, m_fecl4.n_inactive, m_fecl4.n_external, m_fecl4.n_active
+print("orb space: nc, ninact, next, nact = ", n_core, n_inactive, n_external, n_active)
+
+#==================================================================
+# 2. Solve Ground State Problem:
+#    H |Psi0> = E_0 |Psi0>
+#==================================================================
+# 2-1] Initialize block2 solver 
+na, nb = n_elec 
+twos = 0                # for general spin
+n_gmo = n_mo * 2
+n_gcore = n_core * 2
+n_ginactive = n_inactive * 2
+n_gexternal = n_external * 2
+n_gactive = n_active * 2
+orb_sym = [0] * n_gmo
+
+from pyblock2.driver.core import SymmetryTypes
+from pyxray.solver.block.core import XrayDriver
+driver = XrayDriver(
+             scratch=scratch, symm_type=SymmetryTypes.SGFCPX, 
+             n_threads=n_threads, clean_scratch=False, verbose=verbose
+         )
+driver.initialize_system(
+    n_sites=n_gmo, n_elec=na+nb, spin=twos, n_core=n_gcore, n_inact=n_ginactive, 
+    n_exter=n_gexternal, n_act=n_gactive, orb_sym=orb_sym
+)
+
+# 2-2] Generate mpo 
+from pyxray.utils.integral_helper import somf_integrals, bpsoc_integrals
+if somf:
+    h1e, g2e = somf_integrals(h1e, g2e, hso, n_mo) 
+else:
+    h1e, g2e = bpsoc_integrals(h1e, g2e, hso, hso2e, n_mo, tol=int_tol) 
+# check Hermitian
+assert np.linalg.norm(h1e - h1e.transpose(1, 0).conj()) < 1e-9
+assert np.linalg.norm(g2e - g2e.transpose(1, 0, 3, 2).conj()) < 1e-9
+mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=verbose)
+
+# 2-3] Prepare initial mps 
+mps_gs = driver.get_random_restricted_mps(
+             tag="GS", bond_dim=bond_dims_gs[0], n_hole=0
+         )
+
+# 2-4] Solve ground-state problem
+gs_energy = driver.dmrg(mpo, mps_gs, n_sweeps=n_sweeps_gs, bond_dims=bond_dims_gs, 
+                        noises=noises_gs, thrds=thrds_gs, iprint=verbose)
+print('DMRG energy = %20.15f' % gs_energy)
+
+#==================================================================
+# 3. Solve Response Problem:
+#    (w - (H-E_0) + i eta) |A> = mu |Psi0>
+#==================================================================
+dip_dic = {'x': 0, 'y': 1, 'z': 2}
+# 3-1] Generate mpo 
+mpo = -1.0 * mpo
+mpo.const_e += gs_energy 
+from pyxray.utils.integral_helper import spatial_to_spin_integrals
+hr = spatial_to_spin_integrals(hr)
+mpos_dip = [None] * 3
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    mpos_dip[ii] = driver.get_qc_mpo(h1e=hr[ii], g2e=None, ecore=0, iprint=verbose)
+
+# 3-2] Prepare initial mps for |A> 
+mpss_a = [None] * 3
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    mpss_a[ii] = driver.get_random_restricted_mps(
+                    tag="MUKET%d" % ii, bond_dim=bond_dims_cps[0], n_hole=1
+                 )
+
+    driver.comp_gf(
+        mpss_a[ii], mpos_dip[ii], mps_gs, n_sweeps=n_sweeps_cps,
+        bra_bond_dims=bond_dims_cps,
+        bond_dims=[mps_gs.info.bond_dim],
+        thrds=thrds_cps, save_tag="MUKET%d" % ii
+    )
+
+# 3-3] Solve response problem
+gf_mat = np.zeros((3, len(freqs)), dtype=complex)
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    gf_mat[ii], _ = driver.linear_gf(
+                        mpo, mpss_a[ii], mpos_dip[ii], mps_gs, freqs, etas,
+                        bra_bond_dims=bond_dims_cv, bond_dims=bond_dims_cps[-1:], 
+                        noises=noises_cv, n_sweeps=n_sweeps_cv, 
+                        thrds=thrds_cv, save_tag="A%d" % ii, iprint=verbose
+                    )
+
+#==================================================================
+# 4. Compute XAS Spectral Function 
+#==================================================================
+spect_func = (-1 / np.pi) * gf_mat.imag.sum(axis=0)
+print("spectral function for XAS = ", spect_func)
+
+# dump the results
+import h5py
+dip = ''
+for r in dip_elems:
+    dip += '_' + r
+dump_filename = "result_%s_%s_m%d%s.h5" % (method, model, bond_dims_cv[-1], dip)
+ff = h5py.File(dump_filename, "w")
+ff.create_dataset('omega', data=freqs * HARTREE2EV)
+ff.create_dataset('spectral_function', data=spect_func)
+ff.create_dataset('gfmat', data=gf_mat)
+ff.close() 
+
+if dbg:
+    #==================================================================
+    # 5. Plot XAS spectrum 
+    #==================================================================
+    import h5py
+    dip = ''
+    for r in dip_elems:
+        dip += '_' + r
+    dump_filename = "result_%s_%s_m%d%s.h5" % (method, model, bond_dims_cv[-1], dip)
+    ff = h5py.File(dump_filename, "r")
+    freqs = np.array(ff['omega'])
+    spect_func = np.array(ff['spectral_function'])
+
+    const_shift = 7.4
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(15,6))
+    ax.plot(freqs - const_shift, spect_func, '-o', color='black', markersize=2)
+    ax.set_xlabel('Incident Energy - %3.1f (eV)' % const_shift)
+    ax.set_ylabel('XAS Spectral Function')
+    ax.set_xlim([700, 725])
+    plt.savefig('LedgeXAS_%s_%s_m%d%s.png' % (method, model, bond_dims_cv[-1], dip), dpi=200)
+    #plt.show()
+    
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node1', release='5.4.0-167-generic', version='#184-Ubuntu SMP Tue Oct 31 09:21:49 UTC 2023', machine='x86_64', processor='x86_64')  Threads 36
+Python 3.7.16 (default, Jan 17 2023, 22:20:44) 
+[GCC 11.2.0]
+numpy 1.21.5  scipy 1.7.3
+Date: Fri Jan 19 09:42:31 2024
+PySCF version 2.4.0
+PySCF path  /home/amychoi7/programs/pyscf
+GIT HEAD (branch master) 8b7c13a1f91c04bbfc5397800feb77506df5e7df
+
+[CONFIG] conf_file None
+[INPUT] verbose = 5
+[INPUT] max_memory = 4000 
+[INPUT] num. atoms = 5
+[INPUT] num. electrons = 96
+[INPUT] charge = -2
+[INPUT] spin (= nelec alpha-beta = 2S) = 4
+[INPUT] symmetry C1 subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Fe   -17.842999916948  -0.530966943211   6.091047755085 AA  -33.718383083669  -1.003382103867  11.510412068757 Bohr   0.0
+[INPUT]  2 Cl   -19.842884228457   0.310894956198   7.041013197890 AA  -37.497616713235   0.587506320723  13.305586583460 Bohr   0.0
+[INPUT]  3 Cl   -17.842986667581   0.118681250246   3.810679540878 AA  -33.718358045993   0.224275059086   7.201140680742 Bohr   0.0
+[INPUT]  4 Cl   -17.843013522184  -2.870524428185   6.458263914129 AA  -33.718408793839  -5.424505003143  12.204350037865 Bohr   0.0
+[INPUT]  5 Cl   -15.843115664830   0.310915164952   7.040995592019 AA  -29.939149566335   0.587544509733  13.305553313185 Bohr   0.0
+[INPUT] ---------------- BASIS SET ---------------- 
+[INPUT] l, kappa, [nprim/nctr], expnt,             c_1 c_2 ...
+[INPUT] Fe
+[INPUT] 0    0    [21   /5   ]  4316265           0.00015003 -4.622e-05 1.71e-05 -3.53e-06 4.23e-06
+                                646342.4          0.00043597 -0.00013445 4.975e-05 -1.026e-05 1.234e-05
+                                147089.7          0.00120365 -0.00037184 0.00013758 -2.838e-05 3.4e-05
+                                41661.52          0.00312635 -0.00096889 0.00035879 -7.397e-05 8.934e-05
+                                13590.77          0.00814591 -0.00253948 0.00094021 -0.0001941 0.00023098
+                                4905.75           0.02133892 -0.00673001 0.0024986 -0.00051496 0.00062709
+                                1912.746          0.05470838 -0.0176816 0.00657103 -0.00135801 0.00160135
+                                792.6043          0.12845394 -0.0437541 0.01640473 -0.00338297 0.00416181
+                                344.8065          0.25203824 -0.09601111 0.03637157 -0.00754121 0.00877359
+                                155.8999          0.35484986 -0.16998599 0.06664937 -0.01380066 0.01738346
+                                72.23091          0.27043078 -0.18456376 0.07553682 -0.01588736 0.01718943
+                                32.72506          0.06476086 0.058263 -0.02586806 0.00570363 -0.00196602
+                                15.66762          -0.00110466 0.52163758 -0.3123023 0.06807261 -0.09285258
+                                7.503483          0.00184555 0.49331062 -0.44997654 0.10526256 -0.113506
+                                3.312223          -0.000856 0.0863267 0.14773374 -0.04562463 0.01812457
+                                1.558471          0.00037119 -0.00285017 0.72995709 -0.21341607 0.41268036
+                                0.683914          -0.00014687 0.00165569 0.38458847 -0.24353659 0.10339104
+                                0.146757          6.097e-05 -0.00049176 0.0158289 0.34358715 -0.89083095
+                                0.070583          -5.789e-05 0.00047608 -0.00949537 0.46401833 -0.80961283
+                                0.031449          2.77e-05 -0.0002282 0.00308038 0.34688312 1.52308946
+                                0.01258           -7.22e-06 6.297e-05 -0.00100526 0.01225841 0.09142619
+[INPUT] 1    0    [15   /4   ]  7721.489          0.00035287 -0.00012803 -0.00013663 3.845e-05
+                                1829.126          0.00196928 -0.00071517 -0.0007779 0.00021618
+                                593.628           0.00961737 -0.00352108 -0.00375042 0.00105697
+                                226.2054          0.03724273 -0.01379065 -0.01516741 0.00418424
+                                95.26145          0.11332297 -0.04331452 -0.04705206 0.01307817
+                                42.8592           0.25335172 -0.10061222 -0.1152963 0.0309551
+                                20.04971          0.38104215 -0.16161377 -0.17017078 0.04896849
+                                9.620885          0.3070325 -0.11214083 -0.1322083 0.03516849
+                                4.541371          0.08654534 0.18501865 0.53797582 -0.08338612
+                                2.1135            0.00359924 0.4789308 0.61199701 -0.17709305
+                                0.947201          0.00144059 0.40514792 -0.64465308 -0.11907766
+                                0.391243          -0.00029901 0.0987216 -0.61225551 0.12237413
+                                0.156497          0.00020351 -0.00148592 0.10798966 0.5499813
+                                0.062599          -9.626e-05 0.00222977 0.37358045 0.39970337
+                                0.02504           2.881e-05 -0.00072259 0.1878287 0.08298275
+[INPUT] 2    0    [10   /2   ]  217.3688          0.00096699 -0.00098327
+                                64.99976          0.00793294 -0.00789694
+                                24.77314          0.03548314 -0.0364479
+                                10.43614          0.10769519 -0.10760712
+                                4.679653          0.22555488 -0.26104796
+                                2.125622          0.31942979 -0.29085509
+                                0.945242          0.3235439 0.01254821
+                                0.402685          0.2433827 0.40386046
+                                0.156651          0.10680569 0.38672483
+                                0.06266           0.02052711 0.243945
+[INPUT] 3    0    [6    /1   ]  11.2749           0.03802196
+                                4.469             0.25501829
+                                1.7713            0.50897998
+                                0.7021            0.35473516
+                                0.2783            0.12763297
+                                0.1103            0.01946831
+[INPUT] Cl
+[INPUT] 0    0    [17   /4   ]  399432.47         0.00030484 -8.544e-05 2.805e-05 -2.594e-05
+                                56908.833         0.0009769 -0.00027415 8.993e-05 -8.327e-05
+                                16874.769         0.00213829 -0.00060181 0.00019805 -0.00018239
+                                6010.0278         0.00596941 -0.00168491 0.00055165 -0.00051268
+                                2303.283          0.01618189 -0.0046144 0.00152335 -0.00139557
+                                915.65994         0.04523017 -0.0131294 0.00430471 -0.00399682
+                                371.72009         0.11792451 -0.03590977 0.01193457 -0.01084095
+                                152.89109         0.26154412 -0.08838331 0.02937135 -0.02689456
+                                63.436303         0.40192154 -0.17459524 0.06021462 -0.05308441
+                                26.481723         0.26874482 -0.17768036 0.06257166 -0.05725505
+                                11.104112         0.03281694 0.15212083 -0.05661174 0.06432674
+                                4.6716289         0.00355918 0.62550754 -0.32750975 0.302538
+                                1.970452          -0.00170778 0.36355752 -0.34199199 0.51304681
+                                0.8327946         0.00129735 0.00960204 0.31850883 -1.13091935
+                                0.3525409         -0.00065905 0.02635221 0.66176117 -0.72817381
+                                0.1494341         0.00024579 0.00476606 0.27830911 1.17413304
+                                0.0597736         -1.46e-06 0.00086954 0.01682723 0.32946196
+[INPUT] 1    0    [12   /3   ]  1288.9716         0.0009357 -0.00024782 0.00024047
+                                312.2443          0.00612519 -0.00162654 0.00152795
+                                111.34634         0.02562804 -0.00687102 0.00673753
+                                43.736087         0.09281756 -0.02535755 0.02388784
+                                17.856524         0.2434616 -0.06874067 0.06877323
+                                7.4327659         0.41401588 -0.12202766 0.11190534
+                                3.1282538         0.34722988 -0.10596481 0.12059088
+                                1.3257214         0.07646871 0.13708383 -0.22523997
+                                0.5644191         0.00212249 0.42571611 -0.64105309
+                                0.2410741         -0.00079088 0.41428846 0.05174053
+                                0.1032089         -0.00020296 0.1820407 0.69480634
+                                0.0412836         -9.274e-05 0.03011165 0.30411632
+[INPUT] 2    0    [5    /1   ]  3.6204561         0.02670164
+                                1.4775717         0.17231497
+                                0.603023          0.5827404
+                                0.2461043         0.33745593
+                                0.0984417         0.04917881
+
+nuclear repulsion = 632.270226260731
+point group symmetry = C1
+symmetry origin: [0. 0. 0.]
+symmetry axis x: [1. 0. 0.]
+symmetry axis y: [0. 1. 0.]
+symmetry axis z: [0. 0. 1.]
+num. orbitals of irrep A = 106
+number of shells = 16
+number of NR pGTOs = 470
+number of NR cGTOs = 106
+basis = {'Fe': [[0, [4316265.0, 0.00015003, -4.622e-05, 1.71e-05, -3.53e-06, 4.23e-06], [646342.4, 0.00043597, -0.00013445, 4.975e-05, -1.026e-05, 1.234e-05], [147089.7, 0.00120365, -0.00037184, 0.00013758, -2.838e-05, 3.4e-05], [41661.52, 0.00312635, -0.00096889, 0.00035879, -7.397e-05, 8.934e-05], [13590.77, 0.00814591, -0.00253948, 0.00094021, -0.0001941, 0.00023098], [4905.75, 0.02133892, -0.00673001, 0.0024986, -0.00051496, 0.00062709], [1912.746, 0.05470838, -0.0176816, 0.00657103, -0.00135801, 0.00160135], [792.6043, 0.12845394, -0.0437541, 0.01640473, -0.00338297, 0.00416181], [344.8065, 0.25203824, -0.09601111, 0.03637157, -0.00754121, 0.00877359], [155.8999, 0.35484986, -0.16998599, 0.06664937, -0.01380066, 0.01738346], [72.23091, 0.27043078, -0.18456376, 0.07553682, -0.01588736, 0.01718943], [32.72506, 0.06476086, 0.058263, -0.02586806, 0.00570363, -0.00196602], [15.66762, -0.00110466, 0.52163758, -0.3123023, 0.06807261, -0.09285258], [7.503483, 0.00184555, 0.49331062, -0.44997654, 0.10526256, -0.113506], [3.312223, -0.000856, 0.0863267, 0.14773374, -0.04562463, 0.01812457], [1.558471, 0.00037119, -0.00285017, 0.72995709, -0.21341607, 0.41268036], [0.683914, -0.00014687, 0.00165569, 0.38458847, -0.24353659, 0.10339104], [0.146757, 6.097e-05, -0.00049176, 0.0158289, 0.34358715, -0.89083095], [0.070583, -5.789e-05, 0.00047608, -0.00949537, 0.46401833, -0.80961283], [0.031449, 2.77e-05, -0.0002282, 0.00308038, 0.34688312, 1.52308946], [0.01258, -7.22e-06, 6.297e-05, -0.00100526, 0.01225841, 0.09142619]], [1, [7721.489, 0.00035287, -0.00012803, -0.00013663, 3.845e-05], [1829.126, 0.00196928, -0.00071517, -0.0007779, 0.00021618], [593.628, 0.00961737, -0.00352108, -0.00375042, 0.00105697], [226.2054, 0.03724273, -0.01379065, -0.01516741, 0.00418424], [95.26145, 0.11332297, -0.04331452, -0.04705206, 0.01307817], [42.8592, 0.25335172, -0.10061222, -0.1152963, 0.0309551], [20.04971, 0.38104215, -0.16161377, -0.17017078, 0.04896849], [9.620885, 0.3070325, -0.11214083, -0.1322083, 0.03516849], [4.541371, 0.08654534, 0.18501865, 0.53797582, -0.08338612], [2.1135, 0.00359924, 0.4789308, 0.61199701, -0.17709305], [0.947201, 0.00144059, 0.40514792, -0.64465308, -0.11907766], [0.391243, -0.00029901, 0.0987216, -0.61225551, 0.12237413], [0.156497, 0.00020351, -0.00148592, 0.10798966, 0.5499813], [0.062599, -9.626e-05, 0.00222977, 0.37358045, 0.39970337], [0.02504, 2.881e-05, -0.00072259, 0.1878287, 0.08298275]], [2, [217.3688, 0.00096699, -0.00098327], [64.99976, 0.00793294, -0.00789694], [24.77314, 0.03548314, -0.0364479], [10.43614, 0.10769519, -0.10760712], [4.679653, 0.22555488, -0.26104796], [2.125622, 0.31942979, -0.29085509], [0.945242, 0.3235439, 0.01254821], [0.402685, 0.2433827, 0.40386046], [0.156651, 0.10680569, 0.38672483], [0.06266, 0.02052711, 0.243945]], [3, [11.2749, 0.03802196], [4.469, 0.25501829], [1.7713, 0.50897998], [0.7021, 0.35473516], [0.2783, 0.12763297], [0.1103, 0.01946831]]], 'Cl': [[0, [399432.47, 0.00030484, -8.544e-05, 2.805e-05, -2.594e-05], [56908.833, 0.0009769, -0.00027415, 8.993e-05, -8.327e-05], [16874.769, 0.00213829, -0.00060181, 0.00019805, -0.00018239], [6010.0278, 0.00596941, -0.00168491, 0.00055165, -0.00051268], [2303.283, 0.01618189, -0.0046144, 0.00152335, -0.00139557], [915.65994, 0.04523017, -0.0131294, 0.00430471, -0.00399682], [371.72009, 0.11792451, -0.03590977, 0.01193457, -0.01084095], [152.89109, 0.26154412, -0.08838331, 0.02937135, -0.02689456], [63.436303, 0.40192154, -0.17459524, 0.06021462, -0.05308441], [26.481723, 0.26874482, -0.17768036, 0.06257166, -0.05725505], [11.104112, 0.03281694, 0.15212083, -0.05661174, 0.06432674], [4.6716289, 0.00355918, 0.62550754, -0.32750975, 0.302538], [1.970452, -0.00170778, 0.36355752, -0.34199199, 0.51304681], [0.8327946, 0.00129735, 0.00960204, 0.31850883, -1.13091935], [0.3525409, -0.00065905, 0.02635221, 0.66176117, -0.72817381], [0.1494341, 0.00024579, 0.00476606, 0.27830911, 1.17413304], [0.0597736, -1.46e-06, 0.00086954, 0.01682723, 0.32946196]], [1, [1288.9716, 0.0009357, -0.00024782, 0.00024047], [312.2443, 0.00612519, -0.00162654, 0.00152795], [111.34634, 0.02562804, -0.00687102, 0.00673753], [43.736087, 0.09281756, -0.02535755, 0.02388784], [17.856524, 0.2434616, -0.06874067, 0.06877323], [7.4327659, 0.41401588, -0.12202766, 0.11190534], [3.1282538, 0.34722988, -0.10596481, 0.12059088], [1.3257214, 0.07646871, 0.13708383, -0.22523997], [0.5644191, 0.00212249, 0.42571611, -0.64105309], [0.2410741, -0.00079088, 0.41428846, 0.05174053], [0.1032089, -0.00020296, 0.1820407, 0.69480634], [0.0412836, -9.274e-05, 0.03011165, 0.30411632]], [2, [3.6204561, 0.02670164], [1.4775717, 0.17231497], [0.603023, 0.5827404], [0.2461043, 0.33745593], [0.0984417, 0.04917881]]]}
+ecp = {}
+CPU time:         0.59
+Lowdin Pop: Active Orbitals
+Lowdin population for MOs:
+1.462952213688361e-14
+ iorb= 0  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 2px     pop= 0.9999687848271023
+ iorb= 1  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 2py     pop= 0.9999707648009175
+ iorb= 2  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 2pz     pop= 0.9999714245434955
+ iorb= 3  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dyz    pop= 0.7274877955883602
+ iorb= 4  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dxz    pop= 0.8901993345932351
+ iorb= 5  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dxy    pop= 0.8917489513293045
+ iorb= 6  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dx2-y2  pop= 0.6953610814028008
+ iorb= 7  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dz^2   pop= 0.7659957765871979
+irreps of each MO ['A' 'A' 'A' 'A' 'A' 'A' 'A' 'A']
+orb space: nc, ninact, next, nact =  3 0 0 5
