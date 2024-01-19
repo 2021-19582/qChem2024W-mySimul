@@ -1,0 +1,35 @@
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+ 
+:: initializing oneAPI environment ...
+   bash: BASH_VERSION = 5.0.17(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: advisor -- latest
+:: ccl -- latest
+:: compiler -- latest
+:: dal -- latest
+:: debugger -- latest
+:: dev-utilities -- latest
+:: dnnl -- latest
+:: dpcpp-ct -- latest
+:: dpl -- latest
+:: inspector -- latest
+:: ipp -- latest
+:: ippcp -- latest
+:: itac -- latest
+:: mkl -- latest
+:: mpi -- latest
+:: tbb -- latest
+:: vtune -- latest
+:: oneAPI environment initialized ::
+ 
+------------------------ /usr/share/modules/modulefiles ------------------------
+dot  module-git  module-info  modules  null  use.own  
+ERROR: Unable to locate a modulefile for 'jmol-16.1.47'
+------------------------ /usr/share/modules/modulefiles ------------------------
+dot  module-git  module-info  modules  null  use.own  
+ERROR: Unable to locate a modulefile for 'jmol-16.1.47'
+/home/amychoi7/programs/anaconda/envs/pyscf
+python: /home/amychoi7/programs/block2-preview/src/instantiation/dmrg_gz/../../dmrg/../core/iterative_matrix_functions.hpp:553: static std::vector<typename block2::GMatrix<FL>::FP> block2::IterativeMatrixFunctions<FL>::davidson(MatMul&, const block2::GDiagonalMatrix<FL>&, std::vector<block2::GMatrix<FL> >&, block2::IterativeMatrixFunctions<FL>::FP, block2::DavidsonTypes, int&, bool, const PComm&, block2::IterativeMatrixFunctions<FL>::FP, int, int, int, int, const std::vector<block2::GMatrix<FL> >&, const std::vector<typename block2::GMatrix<FL>::FP>&, block2::IterativeMatrixFunctions<FL>::FP) [with MatMul = block2::TensorFunctions<block2::SGLong<true>, std::complex<double> >; PComm = std::shared_ptr<block2::ParallelCommunicator<block2::SGLong<true> > >; FL = std::complex<double>; typename block2::GMatrix<FL>::FP = double; block2::IterativeMatrixFunctions<FL>::FP = double]: Assertion `false' failed.
+mv: cannot stat 'lunoloc.molden': No such file or directory
+mv: cannot stat 'luno.molden': No such file or directory

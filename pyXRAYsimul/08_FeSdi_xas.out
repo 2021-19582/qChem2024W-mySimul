@@ -1,0 +1,1547 @@
+#INFO: **** input file is /home/amychoi7/github_qChem2024/mySimul/pyXRAYsimul/08_FeSdi_xas.py ****
+#    PyXray: a library for ab-initio X-ray spectrum simulation
+#    Copyright (C) 2023  Seunghoon Lee <seunghoonlee89@gmail.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+'''
+An example to run L-edge XAS spectrum calculation. 
+'''
+
+#==================================================================
+# 0. Initial Settings for Ledge XAS 
+#==================================================================
+# parameters for calculation
+#model = 'FeSdi_OX_12o14e_lunoloc'
+model = 'FeSdi_OX_20!!o30e_lunoloc'
+method = 'casci'
+somf = True 
+dip_elems = ['x', 'y', 'z'] 
+
+# parameters for system
+scratch = './nodex_%s' % model
+save_dir = './nodex_%s_save' % model # save mps for gs and cv
+n_threads = 28
+verbose = 2 # 0: quite, 1: minimal, >1: debug
+dbg = True
+
+# parameters for GS DMRG calculation
+n_sweeps_gs = 20 
+bond_dims_gs = [500] * 20 
+noises_gs = [1e-4] * 4 + [1e-5] * 4 + [0]
+thrds_gs = [1e-6] * 8
+
+# parameters for DDMRG calculation
+n_sweeps_cps = 8
+bond_dims_cps = [500] * n_sweeps_cps 
+thrds_cps = [1e-10] * n_sweeps_cps
+
+n_sweeps_cv = 20 
+bond_dims_cv = [500] * n_sweeps_cv 
+noises_cv = [1e-4] * (n_sweeps_cv - 14) + [0.] * 6 
+thrds_cv = [1e-4] * n_sweeps_cv
+
+# parameters for XAS
+import numpy as np
+from pyscf.data import nist
+HARTREE2EV = nist.HARTREE2EV  
+freqs_gap = 0.1
+freq_min = 705
+freq_max = 735
+freqs = np.arange(freq_min, freq_max + 1e-5, freqs_gap)
+freqs /= HARTREE2EV
+etas = np.array([0.3] * len(freqs)) / HARTREE2EV
+
+#==================================================================
+# 1. Generate Active Space Model 
+#==================================================================
+# 1-1] Define molecule
+import FeSdi
+m_FeSdi = FeSdi.ActiveSpaceModel(model)
+mol = m_FeSdi.gen_mol()
+
+# 1-2] Generate orbitals
+import os
+dumpfile = '%s.h5' % model
+if not os.path.isfile(dumpfile):
+    # 1-2-1] UKS orbital optimization 
+    dumpfile_mf = '%s_uks.h5' % model
+    mf = m_FeSdi.do_mf(mol, chkfile=dumpfile_mf)
+    
+    # 1-2-2] localization of nat orbs using spin averaged UKS density 
+    from pyxray.utils.lunoloc import dumpLUNO
+    lmo, enorb, occ = dumpLUNO(mol, mf.mo_coeff, mf.mo_energy, thresh=0.05, 
+                               dumpname=dumpfile, dbg=dbg)
+    if dbg:
+        from pyscf.tools import molden
+        with open('lunoloc.molden','w') as thefile:
+            molden.header(mol, thefile)
+            molden.orbital_coeff(mol, thefile, lmo, ene=enorb, occ=occ)
+    
+# 1-3] Generate active space model and Hamiltonian 
+m_FeSdi.init_model(dumpfile, method=method, dbg=dbg)
+h1e, g2e, ecore = m_FeSdi.gen_ham(tol=1e-6)
+hso, hso2e = m_FeSdi.gen_hso(somf=somf) # hso2e is None if somf is True
+hr = m_FeSdi.gen_hr()
+
+n_mo, n_elec, n_core = m_FeSdi.norb, m_FeSdi.n_elec, m_FeSdi.n_core
+n_core, n_inactive, n_external, n_active = m_FeSdi.n_core, m_FeSdi.n_inactive, m_FeSdi.n_external, m_FeSdi.n_active
+print("orb space: nc, ninact, next, nact = ", n_core, n_inactive, n_external, n_active)
+
+#==================================================================
+# 2. Solve Ground State Problem:
+#    H |Psi0> = E_0 |Psi0>
+#==================================================================
+# 2-1] Initialize block2 solver 
+na, nb = n_elec 
+twos = 0                # for general spin
+n_gmo = n_mo * 2
+n_gcore = n_core * 2
+n_ginactive = n_inactive * 2
+n_gexternal = n_external * 2
+n_gactive = n_active * 2
+orb_sym = [0] * n_gmo
+
+from pyblock2.driver.core import SymmetryTypes
+from pyxray.solver.block.core import XrayDriver
+driver = XrayDriver(
+             scratch=scratch, symm_type=SymmetryTypes.SGFCPX, 
+             n_threads=n_threads, clean_scratch=False, verbose=verbose
+         )
+driver.initialize_system(
+    n_sites=n_gmo, n_elec=na+nb, spin=twos, n_core=n_gcore, n_inact=n_ginactive, 
+    n_exter=n_gexternal, n_act=n_gactive, orb_sym=orb_sym
+)
+
+# 2-2] Generate mpo 
+from pyxray.utils.integral_helper import somf_integrals, bpsoc_integrals
+if somf:
+    h1e, g2e = somf_integrals(h1e, g2e, hso, n_mo) 
+else:
+    h1e, g2e = bpsoc_integrals(h1e, g2e, hso, hso2e, n_mo, tol=int_tol) 
+# check Hermitian
+assert np.linalg.norm(h1e - h1e.transpose(1, 0).conj()) < 1e-9
+assert np.linalg.norm(g2e - g2e.transpose(1, 0, 3, 2).conj()) < 1e-9
+mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=verbose)
+
+# 2-3] Prepare initial mps 
+mps_gs = driver.get_random_restricted_mps(
+             tag="GS", bond_dim=bond_dims_gs[0], n_hole=0
+         )
+
+# 2-4] Solve ground-state problem
+gs_energy = driver.dmrg(mpo, mps_gs, n_sweeps=n_sweeps_gs, bond_dims=bond_dims_gs, 
+                        noises=noises_gs, thrds=thrds_gs, iprint=verbose)
+print('DMRG energy = %20.15f' % gs_energy)
+
+#==================================================================
+# 3. Solve Response Problem:
+#    (w - (H-E_0) + i eta) |A> = mu |Psi0>
+#==================================================================
+dip_dic = {'x': 0, 'y': 1, 'z': 2}
+# 3-1] Generate mpo 
+mpo = -1.0 * mpo
+mpo.const_e += gs_energy 
+from pyxray.utils.integral_helper import spatial_to_spin_integrals
+hr = spatial_to_spin_integrals(hr)
+mpos_dip = [None] * 3
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    mpos_dip[ii] = driver.get_qc_mpo(h1e=hr[ii], g2e=None, ecore=0, iprint=verbose)
+
+# 3-2] Prepare initial mps for |A> 
+mpss_a = [None] * 3
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    mpss_a[ii] = driver.get_random_restricted_mps(
+                    tag="MUKET%d" % ii, bond_dim=bond_dims_cps[0], n_hole=1
+                 )
+
+    driver.comp_gf(
+        mpss_a[ii], mpos_dip[ii], mps_gs, n_sweeps=n_sweeps_cps,
+        bra_bond_dims=bond_dims_cps,
+        bond_dims=[mps_gs.info.bond_dim],
+        thrds=thrds_cps, save_tag="MUKET%d" % ii
+    )
+
+# 3-3] Solve response problem
+gf_mat = np.zeros((3, len(freqs)), dtype=complex)
+for r in dip_elems: # loop for x, y, z
+    ii = dip_dic[r]
+    gf_mat[ii], _ = driver.linear_gf(
+                        mpo, mpss_a[ii], mpos_dip[ii], mps_gs, freqs, etas,
+                        bra_bond_dims=bond_dims_cv, bond_dims=bond_dims_cps[-1:], 
+                        noises=noises_cv, n_sweeps=n_sweeps_cv, 
+                        thrds=thrds_cv, save_tag="A%d" % ii, iprint=verbose
+                    )
+
+#==================================================================
+# 4. Compute XAS Spectral Function 
+#==================================================================
+spect_func = (-1 / np.pi) * gf_mat.imag.sum(axis=0)
+print("spectral function for XAS = ", spect_func)
+
+# dump the results
+import h5py
+dip = ''
+for r in dip_elems:
+    dip += '_' + r
+dump_filename = "result_%s_%s_m%d%s.h5" % (method, model, bond_dims_cv[-1], dip)
+ff = h5py.File(dump_filename, "w")
+ff.create_dataset('omega', data=freqs * HARTREE2EV)
+ff.create_dataset('spectral_function', data=spect_func)
+ff.create_dataset('gfmat', data=gf_mat)
+ff.close() 
+
+if dbg:
+    #==================================================================
+    # 5. Plot XAS spectrum 
+    #==================================================================
+    import h5py
+    dip = ''
+    for r in dip_elems:
+        dip += '_' + r
+    dump_filename = "result_%s_%s_m%d%s.h5" % (method, model, bond_dims_cv[-1], dip)
+    ff = h5py.File(dump_filename, "r")
+    freqs = np.array(ff['omega'])
+    spect_func = np.array(ff['spectral_function'])
+
+    const_shift = 7.4
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(15,6))
+    ax.plot(freqs - const_shift, spect_func, '-o', color='black', markersize=2)
+    ax.set_xlabel('Incident Energy - %3.1f (eV)' % const_shift)
+    ax.set_ylabel('XAS Spectral Function')
+    ax.set_xlim([700, 725])
+    plt.savefig('LedgeXAS_%s_%s_m%d%s.png' % (method, model, bond_dims_cv[-1], dip), dpi=200)
+    #plt.show()
+    
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node5', release='5.4.0-100-generic', version='#113-Ubuntu SMP Thu Feb 3 18:43:29 UTC 2022', machine='x86_64', processor='x86_64')  Threads 36
+Python 3.7.12 | packaged by conda-forge | (default, Oct 26 2021, 06:08:21) 
+[GCC 9.4.0]
+numpy 1.21.5  scipy 1.7.3
+Date: Fri Jan 19 15:04:53 2024
+PySCF version 2.4.0
+PySCF path  /home/amychoi7/programs/pyscf
+GIT HEAD (branch master) 8b7c13a1f91c04bbfc5397800feb77506df5e7df
+
+[CONFIG] conf_file None
+[INPUT] verbose = 5
+[INPUT] max_memory = 4000 
+[INPUT] num. atoms = 24
+[INPUT] num. electrons = 186
+[INPUT] charge = -2
+[INPUT] spin (= nelec alpha-beta = 2S) = 10
+[INPUT] symmetry C1 subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 Fe     5.220000000000   1.050000000000  -7.950000000000 AA    9.864370370230   1.984212430793 -15.023322690292 Bohr   0.0
+[INPUT]  2 S      3.860000000000  -0.280000000000  -9.060000000000 AA    7.294342840821  -0.529123314878 -17.120918688559 Bohr   0.0
+[INPUT]  3 S      5.000000000000   0.950000000000  -5.660000000000 AA    9.448630622825   1.795239818337 -10.695849865038 Bohr   0.0
+[INPUT]  4 S      4.770000000000   3.180000000000  -8.740000000000 AA    9.013993614175   6.009329076117 -16.516206328699 Bohr   0.0
+[INPUT]  5 S      7.230000000000   0.280000000000  -8.380000000000 AA   13.662719880605   0.529123314878 -15.835904923855 Bohr   0.0
+[INPUT]  6 Fe     5.880000000000  -1.050000000000  -9.490000000000 AA   11.111589612443  -1.984212430793 -17.933500922122 Bohr   0.0
+[INPUT]  7 S      6.100000000000  -0.950000000000 -11.790000000000 AA   11.527329359847  -1.795239818337 -22.279871008622 Bohr   0.0
+[INPUT]  8 S      6.330000000000  -3.180000000000  -8.710000000000 AA   11.961966368497  -6.009329076117 -16.459514544962 Bohr   0.0
+[INPUT]  9 C      6.000000000000   4.340000000000  -8.170000000000 AA   11.338356747390   8.201411380612 -15.439062437697 Bohr   0.0
+[INPUT] 10 H      6.460000000000   4.810000000000  -9.010000000000 AA   12.207630764690   9.089582659158 -17.026432382331 Bohr   0.0
+[INPUT] 11 H      5.530000000000   5.080000000000  -7.550000000000 AA   10.450185468845   9.599808712791 -14.267432240466 Bohr   0.0
+[INPUT] 12 H      6.740000000000   3.820000000000  -7.600000000000 AA   12.736754079569   7.218753795839 -14.361918546694 Bohr   0.0
+[INPUT] 13 C      3.330000000000   1.310000000000  -5.180000000000 AA    6.292787994802   2.475541223180  -9.788781325247 Bohr   0.0
+[INPUT] 14 H      2.710000000000   0.460000000000  -5.370000000000 AA    5.121157797571   0.869274017300 -10.147829288914 Bohr   0.0
+[INPUT] 15 H      3.300000000000   1.540000000000  -4.130000000000 AA    6.236096211065   2.910178231830  -7.804568894454 Bohr   0.0
+[INPUT] 16 H      2.970000000000   2.150000000000  -5.730000000000 AA    5.612486589958   4.062911167815 -10.828130693758 Bohr   0.0
+[INPUT] 17 C      5.100000000000  -4.340000000000  -9.280000000000 AA    9.637603235282  -8.201411380612 -17.536658435964 Bohr   0.0
+[INPUT] 18 H      5.560000000000  -5.050000000000  -9.930000000000 AA   10.506877252582  -9.543116929054 -18.764980416931 Bohr   0.0
+[INPUT] 19 H      4.670000000000  -4.840000000000  -8.440000000000 AA    8.825021001719  -9.146274442895 -15.949288491329 Bohr   0.0
+[INPUT] 20 H      4.340000000000  -3.810000000000  -9.810000000000 AA    8.201411380612  -7.199856534593 -18.538213281983 Bohr   0.0
+[INPUT] 21 C      7.770000000000  -1.310000000000 -12.270000000000 AA   14.683171987871  -2.475541223180 -23.186939548413 Bohr   0.0
+[INPUT] 22 H      7.840000000000  -1.350000000000 -13.340000000000 AA   14.815452816590  -2.551130268163 -25.208946501698 Bohr   0.0
+[INPUT] 23 H      8.420000000000  -0.540000000000 -11.900000000000 AA   15.911493968838  -1.020452107265 -22.487740882324 Bohr   0.0
+[INPUT] 24 H      8.060000000000  -2.250000000000 -11.860000000000 AA   15.231192563994  -4.251883780271 -22.412151837342 Bohr   0.0
+[INPUT] ---------------- BASIS SET ---------------- 
+[INPUT] l, kappa, [nprim/nctr], expnt,             c_1 c_2 ...
+[INPUT] S
+[INPUT] 0    0    [5    /1   ]  131334.981146     0.0045222
+                                20181.9004192     0.0170834
+                                4835.70463137     0.06138
+                                1439.7381539      0.2163513
+                                476.15426264      0.7006628
+[INPUT] 0    0    [2    /1   ]  3.37495581        -0.6416942
+                                1.51749916        -0.3583057
+[INPUT] 0    0    [1    /1   ]  168.68252004         1
+[INPUT] 0    0    [1    /1   ]  62.92253974          1
+[INPUT] 0    0    [1    /1   ]  24.33329987          1
+[INPUT] 0    0    [1    /1   ]  6.86573753           1
+[INPUT] 0    0    [1    /1   ]  0.44651463           1
+[INPUT] 0    0    [1    /1   ]  0.16174242           1
+[INPUT] 1    0    [6    /1   ]  754.1523594       0.0016298
+                                193.63344693      0.0107176
+                                64.14106193       0.0507981
+                                23.75714449       0.1689232
+                                9.45234322        0.3528926
+                                3.93996824        0.4150384
+[INPUT] 1    0    [1    /1   ]  1.72080555           1
+[INPUT] 1    0    [1    /1   ]  0.77076298           1
+[INPUT] 1    0    [1    /1   ]  0.28737379           1
+[INPUT] 1    0    [1    /1   ]  0.1011323            1
+[INPUT] 2    0    [1    /1   ]  0.264839             1
+[INPUT] 2    0    [1    /1   ]  0.781337             1
+[INPUT] 3    0    [1    /1   ]  0.58379              1
+[INPUT] C
+[INPUT] 0    0    [5    /1   ]  7615.0599911      0.0020534
+                                1145.08684615     0.0130533
+                                261.91952431      0.0643852
+                                74.66834196       0.2434904
+                                24.40551202       0.6770175
+[INPUT] 0    0    [2    /1   ]  8.68679013        0.5654885
+                                3.23657623        0.4345114
+[INPUT] 0    0    [1    /1   ]  1.30179999           1
+[INPUT] 0    0    [1    /1   ]  0.52768873           1
+[INPUT] 0    0    [1    /1   ]  0.15694534           1
+[INPUT] 1    0    [4    /1   ]  34.50767936       0.0105595
+                                7.91304441        0.0694749
+                                2.36615458        0.2809656
+                                0.81172425        0.6389997
+[INPUT] 1    0    [1    /1   ]  0.31228882           1
+[INPUT] 1    0    [1    /1   ]  0.11400266           1
+[INPUT] 2    0    [1    /1   ]  1.154049             1
+[INPUT] 2    0    [1    /1   ]  0.3511286            1
+[INPUT] 3    0    [1    /1   ]  0.819312             1
+[INPUT] H
+[INPUT] 0    0    [3    /1   ]  34.87758369       0.0233625
+                                5.23397281        0.1708758
+                                1.18503342        0.8057615
+[INPUT] 0    0    [1    /1   ]  0.32833943           1
+[INPUT] 0    0    [1    /1   ]  0.11031918           1
+[INPUT] 1    0    [1    /1   ]  0.718844             1
+[INPUT] 1    0    [1    /1   ]  0.35                 1
+[INPUT] 2    0    [1    /1   ]  1.07506              1
+[INPUT] Fe
+[INPUT] 0    0    [6    /1   ]  489363.919998     0.0030585
+                                76936.8824954     0.0091433
+                                19111.8789691     0.0269235
+                                5953.14711781     0.0759663
+                                2026.23124631     0.2328575
+                                720.41679911      0.6520506
+[INPUT] 0    0    [2    /1   ]  109.11058782      0.7224607
+                                46.72162464       0.2775392
+[INPUT] 0    0    [2    /1   ]  2.44747866        0.3809404
+                                1.1660482         0.6190595
+[INPUT] 0    0    [1    /1   ]  270.92857792         1
+[INPUT] 0    0    [1    /1   ]  17.32120133          1
+[INPUT] 0    0    [1    /1   ]  7.50518249           1
+[INPUT] 0    0    [1    /1   ]  0.53243004           1
+[INPUT] 0    0    [1    /1   ]  0.11921823           1
+[INPUT] 0    0    [1    /1   ]  0.04225089           1
+[INPUT] 1    0    [5    /1   ]  4524.59978956     0.0025908
+                                1117.10671951     0.0145309
+                                383.18041997      0.0647179
+                                150.91292643      0.2368595
+                                63.20731062       0.6813006
+[INPUT] 1    0    [2    /1   ]  27.51598778       0.4837345
+                                12.38754653       0.5162654
+[INPUT] 1    0    [3    /1   ]  2.50956697        0.4902485
+                                1.07890467        0.4747177
+                                0.43388971        0.0350337
+[INPUT] 1    0    [1    /1   ]  5.64019838           1
+[INPUT] 1    0    [1    /1   ]  0.819521             1
+[INPUT] 1    0    [1    /1   ]  0.42475725           1
+[INPUT] 2    0    [4    /1   ]  57.37689087       0.0186728
+                                16.5000892        0.1094061
+                                5.79890555        0.3298519
+                                2.17706897        0.5420691
+[INPUT] 2    0    [1    /1   ]  0.79292368           1
+[INPUT] 2    0    [1    /1   ]  0.26063792           1
+[INPUT] 3    0    [1    /1   ]  3.44034529           1
+[INPUT] 3    0    [1    /1   ]  0.84589748           1
+[INPUT] 4    0    [1    /1   ]  2.25265017           1
+
+nuclear repulsion = 2358.93191408317
+point group symmetry = C1
+symmetry origin: [0. 0. 0.]
+symmetry axis x: [1. 0. 0.]
+symmetry axis y: [0. 1. 0.]
+symmetry axis z: [0. 0. 1.]
+num. orbitals of irrep A = 662
+number of shells = 254
+number of NR pGTOs = 948
+number of NR cGTOs = 662
+basis = tzp-dkh
+ecp = {}
+CPU time:         6.68
+Lowdin Pop: Active Orbitals
+Lowdin population for MOs:
+2.0091790677838182e-14
+ iorb= 0  occ= 0.0  <i|F|i>= 0.0
+    iao= 6 S 8s      pop= 0.3003563936395429
+ iorb= 1  occ= 0.0  <i|F|i>= 0.0
+    iao= 2 S 5pz     pop= 0.2855157980955594
+ iorb= 2  occ= 0.0  <i|F|i>= 0.0
+    iao= 7 S 5py     pop= 0.21311701010905781
+ iorb= 3  occ= 0.0  <i|F|i>= 0.0
+    iao= 3 S 5py     pop= 0.21305785359493798
+ iorb= 4  occ= 0.0  <i|F|i>= 0.0
+    iao= 4 S 5py     pop= 0.1337607366854871
+ iorb= 5  occ= 0.0  <i|F|i>= 0.0
+    iao= 4 S 5px     pop= 0.19431444599887815
+ iorb= 6  occ= 0.0  <i|F|i>= 0.0
+    iao= 1 S 5py     pop= 0.1333445169875885
+ iorb= 7  occ= 0.0  <i|F|i>= 0.0
+    iao= 1 S 5px     pop= 0.19492961815104798
+ iorb= 8  occ= 0.0  <i|F|i>= 0.0
+    iao= 4 S 5pz     pop= 0.18294313796909165
+ iorb= 9  occ= 0.0  <i|F|i>= 0.0
+    iao= 1 S 5pz     pop= 0.18115268303114107
+ iorb= 10  occ= 0.0  <i|F|i>= 0.0
+    iao= 5 Fe 3dxz    pop= 0.28735226961653215
+ iorb= 11  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dxz    pop= 0.17377210307967467
+ iorb= 12  occ= 0.0  <i|F|i>= 0.0
+    iao= 5 Fe 3dx2-y2  pop= 0.1997426598114581
+ iorb= 13  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dx2-y2  pop= 0.20438626243898197
+ iorb= 14  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dx2-y2  pop= 0.17580778665421906
+ iorb= 15  occ= 0.0  <i|F|i>= 0.0
+    iao= 5 Fe 3dz^2   pop= 0.13641549497203592
+ iorb= 16  occ= 0.0  <i|F|i>= 0.0
+    iao= 5 Fe 3dxy    pop= 0.15059921629727951
+ iorb= 17  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dyz    pop= 0.16929800339855214
+ iorb= 18  occ= 0.0  <i|F|i>= 0.0
+    iao= 5 Fe 3dz^2   pop= 0.1309632918650146
+ iorb= 19  occ= 0.0  <i|F|i>= 0.0
+    iao= 0 Fe 3dz^2   pop= 0.25939150310067116
+irreps of each MO ['A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A' 'A'
+ 'A' 'A']
+    CPU time for init_direct_scf      1.72 sec, wall time      0.05 sec
+    CPU time for vj and vk    370.65 sec, wall time     10.30 sec
+MO integrals int2e_sph are saved in <HDF5 file "tmpedpap56n" (mode r+)>/eri_mo
+num. MO ints = 44100, required disk 0.3528 MB
+step1: tmpfile /tmp/tmpo3jct1iw  368.68104 MB
+step1: (ij,kl) = (210,219453), mem cache 4000 MB, iobuf 800 MB
+    CPU time for Initializing ao2mo.outcore.half_e1      2.75 sec, wall time      0.08 sec
+    CPU time for AO->MO transformation for int2e_sph 1 pass   2284.98 sec, wall time     63.65 sec
+step2: kl-pair (ao 219453, mo 210), mem 280.89984 MB, ioblock 0.2688 MB
+    CPU time for AO->MO transformation for int2e_sph 2 pass     13.68 sec, wall time      0.46 sec
+    CPU time for AO->MO transformation for int2e_sph    2298.66 sec, wall time     64.11 sec
+orb space: nc, ninact, next, nact =  10 0 0 10
+integral symmetrize error =  0.0
+integral cutoff error =  0.0
+mpo terms =     248892
+
+Build MPO | Nsites =    40 | Nterms =     248892 | Algorithm = FastBIP | Cutoff = 1.00e-20
+ Site =     0 /    40 .. Mmpo =     9 DW = 0.00e+00 NNZ =        9 SPT = 0.0000 Tmvc = 0.011 T = 0.047
+ Site =     1 /    40 .. Mmpo =    24 DW = 0.00e+00 NNZ =       21 SPT = 0.9028 Tmvc = 0.021 T = 0.056
+ Site =     2 /    40 .. Mmpo =    55 DW = 0.00e+00 NNZ =       55 SPT = 0.9583 Tmvc = 0.023 T = 0.061
+ Site =     3 /    40 .. Mmpo =   102 DW = 0.00e+00 NNZ =      111 SPT = 0.9802 Tmvc = 0.025 T = 0.069
+ Site =     4 /    40 .. Mmpo =   137 DW = 0.00e+00 NNZ =     1797 SPT = 0.8714 Tmvc = 0.029 T = 0.079
+ Site =     5 /    40 .. Mmpo =   160 DW = 0.00e+00 NNZ =     1253 SPT = 0.9428 Tmvc = 0.030 T = 0.084
+ Site =     6 /    40 .. Mmpo =   187 DW = 0.00e+00 NNZ =     1751 SPT = 0.9415 Tmvc = 0.032 T = 0.091
+ Site =     7 /    40 .. Mmpo =   218 DW = 0.00e+00 NNZ =     2187 SPT = 0.9464 Tmvc = 0.035 T = 0.097
+ Site =     8 /    40 .. Mmpo =   253 DW = 0.00e+00 NNZ =     2795 SPT = 0.9493 Tmvc = 0.037 T = 0.104
+ Site =     9 /    40 .. Mmpo =   292 DW = 0.00e+00 NNZ =     3311 SPT = 0.9552 Tmvc = 0.038 T = 0.108
+ Site =    10 /    40 .. Mmpo =   335 DW = 0.00e+00 NNZ =     3991 SPT = 0.9592 Tmvc = 0.041 T = 0.115
+ Site =    11 /    40 .. Mmpo =   382 DW = 0.00e+00 NNZ =     4555 SPT = 0.9644 Tmvc = 0.043 T = 0.119
+ Site =    12 /    40 .. Mmpo =   433 DW = 0.00e+00 NNZ =     5249 SPT = 0.9683 Tmvc = 0.044 T = 0.122
+ Site =    13 /    40 .. Mmpo =   488 DW = 0.00e+00 NNZ =     5829 SPT = 0.9724 Tmvc = 0.045 T = 0.124
+ Site =    14 /    40 .. Mmpo =   547 DW = 0.00e+00 NNZ =     6551 SPT = 0.9755 Tmvc = 0.045 T = 0.128
+ Site =    15 /    40 .. Mmpo =   610 DW = 0.00e+00 NNZ =     7139 SPT = 0.9786 Tmvc = 0.049 T = 0.133
+ Site =    16 /    40 .. Mmpo =   677 DW = 0.00e+00 NNZ =     7825 SPT = 0.9811 Tmvc = 0.048 T = 0.135
+ Site =    17 /    40 .. Mmpo =   748 DW = 0.00e+00 NNZ =     8389 SPT = 0.9834 Tmvc = 0.047 T = 0.134
+ Site =    18 /    40 .. Mmpo =   823 DW = 0.00e+00 NNZ =     9043 SPT = 0.9853 Tmvc = 0.049 T = 0.135
+ Site =    19 /    40 .. Mmpo =   902 DW = 0.00e+00 NNZ =     9559 SPT = 0.9871 Tmvc = 0.050 T = 0.135
+ Site =    20 /    40 .. Mmpo =   823 DW = 0.00e+00 NNZ =    94856 SPT = 0.8722 Tmvc = 0.054 T = 0.248
+ Site =    21 /    40 .. Mmpo =   748 DW = 0.00e+00 NNZ =    14846 SPT = 0.9759 Tmvc = 0.022 T = 0.080
+ Site =    22 /    40 .. Mmpo =   677 DW = 0.00e+00 NNZ =     8436 SPT = 0.9833 Tmvc = 0.017 T = 0.057
+ Site =    23 /    40 .. Mmpo =   610 DW = 0.00e+00 NNZ =     7874 SPT = 0.9809 Tmvc = 0.016 T = 0.052
+ Site =    24 /    40 .. Mmpo =   547 DW = 0.00e+00 NNZ =     7192 SPT = 0.9784 Tmvc = 0.014 T = 0.047
+ Site =    25 /    40 .. Mmpo =   488 DW = 0.00e+00 NNZ =     6606 SPT = 0.9753 Tmvc = 0.013 T = 0.042
+ Site =    26 /    40 .. Mmpo =   433 DW = 0.00e+00 NNZ =     5888 SPT = 0.9721 Tmvc = 0.011 T = 0.037
+ Site =    27 /    40 .. Mmpo =   382 DW = 0.00e+00 NNZ =     5302 SPT = 0.9679 Tmvc = 0.010 T = 0.032
+ Site =    28 /    40 .. Mmpo =   335 DW = 0.00e+00 NNZ =     4612 SPT = 0.9640 Tmvc = 0.009 T = 0.027
+ Site =    29 /    40 .. Mmpo =   292 DW = 0.00e+00 NNZ =     4050 SPT = 0.9586 Tmvc = 0.007 T = 0.022
+ Site =    30 /    40 .. Mmpo =   253 DW = 0.00e+00 NNZ =     3392 SPT = 0.9541 Tmvc = 0.006 T = 0.018
+ Site =    31 /    40 .. Mmpo =   218 DW = 0.00e+00 NNZ =     2878 SPT = 0.9478 Tmvc = 0.004 T = 0.014
+ Site =    32 /    40 .. Mmpo =   187 DW = 0.00e+00 NNZ =     2292 SPT = 0.9438 Tmvc = 0.003 T = 0.011
+ Site =    33 /    40 .. Mmpo =   160 DW = 0.00e+00 NNZ =     1850 SPT = 0.9382 Tmvc = 0.002 T = 0.008
+ Site =    34 /    40 .. Mmpo =   137 DW = 0.00e+00 NNZ =     1362 SPT = 0.9379 Tmvc = 0.002 T = 0.006
+ Site =    35 /    40 .. Mmpo =   102 DW = 0.00e+00 NNZ =     2092 SPT = 0.8503 Tmvc = 0.001 T = 0.006
+ Site =    36 /    40 .. Mmpo =    55 DW = 0.00e+00 NNZ =      118 SPT = 0.9790 Tmvc = 0.000 T = 0.001
+ Site =    37 /    40 .. Mmpo =    24 DW = 0.00e+00 NNZ =       60 SPT = 0.9545 Tmvc = 0.000 T = 0.000
+ Site =    38 /    40 .. Mmpo =     9 DW = 0.00e+00 NNZ =       24 SPT = 0.8889 Tmvc = 0.000 T = 0.000
+ Site =    39 /    40 .. Mmpo =     1 DW = 0.00e+00 NNZ =        9 SPT = 0.0000 Tmvc = 0.000 T = 0.002
+Ttotal =      2.786 Tmvc-total = 0.933 MPO bond dimension =   902 MaxDW = 0.00e+00
+NNZ =       255159 SIZE =      7446374 SPT = 0.9657
+
+Rank =     0 Ttotal =      2.803 MPO method = FastBipartite bond dimension =     902 NNZ =       255159 SIZE =      7446374 SPT = 0.9657
+org mps_info left_dims_fci
+< NF=0 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 2
+< NF=2 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 3
+< NF=2 PG=0 > : 3
+< NF=3 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 4
+< NF=2 PG=0 > : 6
+< NF=3 PG=0 > : 4
+< NF=4 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 5
+< NF=2 PG=0 > : 10
+< NF=3 PG=0 > : 10
+< NF=4 PG=0 > : 5
+< NF=5 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 6
+< NF=2 PG=0 > : 15
+< NF=3 PG=0 > : 20
+< NF=4 PG=0 > : 15
+< NF=5 PG=0 > : 6
+< NF=6 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 7
+< NF=2 PG=0 > : 21
+< NF=3 PG=0 > : 35
+< NF=4 PG=0 > : 35
+< NF=5 PG=0 > : 21
+< NF=6 PG=0 > : 7
+< NF=7 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 8
+< NF=2 PG=0 > : 28
+< NF=3 PG=0 > : 56
+< NF=4 PG=0 > : 70
+< NF=5 PG=0 > : 56
+< NF=6 PG=0 > : 28
+< NF=7 PG=0 > : 8
+< NF=8 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 9
+< NF=2 PG=0 > : 36
+< NF=3 PG=0 > : 84
+< NF=4 PG=0 > : 126
+< NF=5 PG=0 > : 126
+< NF=6 PG=0 > : 84
+< NF=7 PG=0 > : 36
+< NF=8 PG=0 > : 9
+< NF=9 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 10
+< NF=2 PG=0 > : 45
+< NF=3 PG=0 > : 120
+< NF=4 PG=0 > : 210
+< NF=5 PG=0 > : 252
+< NF=6 PG=0 > : 210
+< NF=7 PG=0 > : 120
+< NF=8 PG=0 > : 45
+< NF=9 PG=0 > : 10
+< NF=10 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 11
+< NF=2 PG=0 > : 55
+< NF=3 PG=0 > : 165
+< NF=4 PG=0 > : 330
+< NF=5 PG=0 > : 462
+< NF=6 PG=0 > : 462
+< NF=7 PG=0 > : 330
+< NF=8 PG=0 > : 165
+< NF=9 PG=0 > : 55
+< NF=10 PG=0 > : 11
+< NF=11 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 12
+< NF=2 PG=0 > : 66
+< NF=3 PG=0 > : 220
+< NF=4 PG=0 > : 495
+< NF=5 PG=0 > : 792
+< NF=6 PG=0 > : 924
+< NF=7 PG=0 > : 792
+< NF=8 PG=0 > : 495
+< NF=9 PG=0 > : 220
+< NF=10 PG=0 > : 66
+< NF=11 PG=0 > : 12
+< NF=12 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 13
+< NF=2 PG=0 > : 78
+< NF=3 PG=0 > : 286
+< NF=4 PG=0 > : 715
+< NF=5 PG=0 > : 1287
+< NF=6 PG=0 > : 1716
+< NF=7 PG=0 > : 1716
+< NF=8 PG=0 > : 1287
+< NF=9 PG=0 > : 715
+< NF=10 PG=0 > : 286
+< NF=11 PG=0 > : 78
+< NF=12 PG=0 > : 13
+< NF=13 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 14
+< NF=2 PG=0 > : 91
+< NF=3 PG=0 > : 364
+< NF=4 PG=0 > : 1001
+< NF=5 PG=0 > : 2002
+< NF=6 PG=0 > : 3003
+< NF=7 PG=0 > : 3432
+< NF=8 PG=0 > : 3003
+< NF=9 PG=0 > : 2002
+< NF=10 PG=0 > : 1001
+< NF=11 PG=0 > : 364
+< NF=12 PG=0 > : 91
+< NF=13 PG=0 > : 14
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 15
+< NF=2 PG=0 > : 105
+< NF=3 PG=0 > : 455
+< NF=4 PG=0 > : 1365
+< NF=5 PG=0 > : 3003
+< NF=6 PG=0 > : 5005
+< NF=7 PG=0 > : 6435
+< NF=8 PG=0 > : 6435
+< NF=9 PG=0 > : 5005
+< NF=10 PG=0 > : 3003
+< NF=11 PG=0 > : 1365
+< NF=12 PG=0 > : 300
+< NF=13 PG=0 > : 25
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 16
+< NF=2 PG=0 > : 120
+< NF=3 PG=0 > : 560
+< NF=4 PG=0 > : 1820
+< NF=5 PG=0 > : 4368
+< NF=6 PG=0 > : 8008
+< NF=7 PG=0 > : 11440
+< NF=8 PG=0 > : 12870
+< NF=9 PG=0 > : 11440
+< NF=10 PG=0 > : 8008
+< NF=11 PG=0 > : 2024
+< NF=12 PG=0 > : 276
+< NF=13 PG=0 > : 24
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 17
+< NF=2 PG=0 > : 136
+< NF=3 PG=0 > : 680
+< NF=4 PG=0 > : 2380
+< NF=5 PG=0 > : 6188
+< NF=6 PG=0 > : 12376
+< NF=7 PG=0 > : 19448
+< NF=8 PG=0 > : 24310
+< NF=9 PG=0 > : 24310
+< NF=10 PG=0 > : 8855
+< NF=11 PG=0 > : 1771
+< NF=12 PG=0 > : 253
+< NF=13 PG=0 > : 23
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 18
+< NF=2 PG=0 > : 153
+< NF=3 PG=0 > : 816
+< NF=4 PG=0 > : 3060
+< NF=5 PG=0 > : 8568
+< NF=6 PG=0 > : 18564
+< NF=7 PG=0 > : 31824
+< NF=8 PG=0 > : 43758
+< NF=9 PG=0 > : 26334
+< NF=10 PG=0 > : 7315
+< NF=11 PG=0 > : 1540
+< NF=12 PG=0 > : 231
+< NF=13 PG=0 > : 22
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 19
+< NF=2 PG=0 > : 171
+< NF=3 PG=0 > : 969
+< NF=4 PG=0 > : 3876
+< NF=5 PG=0 > : 11628
+< NF=6 PG=0 > : 27132
+< NF=7 PG=0 > : 50388
+< NF=8 PG=0 > : 54264
+< NF=9 PG=0 > : 20349
+< NF=10 PG=0 > : 5985
+< NF=11 PG=0 > : 1330
+< NF=12 PG=0 > : 210
+< NF=13 PG=0 > : 21
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 20
+< NF=2 PG=0 > : 190
+< NF=3 PG=0 > : 1140
+< NF=4 PG=0 > : 4845
+< NF=5 PG=0 > : 15504
+< NF=6 PG=0 > : 38760
+< NF=7 PG=0 > : 77520
+< NF=8 PG=0 > : 38760
+< NF=9 PG=0 > : 15504
+< NF=10 PG=0 > : 4845
+< NF=11 PG=0 > : 1140
+< NF=12 PG=0 > : 190
+< NF=13 PG=0 > : 20
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 21
+< NF=2 PG=0 > : 210
+< NF=3 PG=0 > : 1330
+< NF=4 PG=0 > : 5985
+< NF=5 PG=0 > : 20349
+< NF=6 PG=0 > : 54264
+< NF=7 PG=0 > : 50388
+< NF=8 PG=0 > : 27132
+< NF=9 PG=0 > : 11628
+< NF=10 PG=0 > : 3876
+< NF=11 PG=0 > : 969
+< NF=12 PG=0 > : 171
+< NF=13 PG=0 > : 19
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 22
+< NF=2 PG=0 > : 231
+< NF=3 PG=0 > : 1540
+< NF=4 PG=0 > : 7315
+< NF=5 PG=0 > : 26334
+< NF=6 PG=0 > : 43758
+< NF=7 PG=0 > : 31824
+< NF=8 PG=0 > : 18564
+< NF=9 PG=0 > : 8568
+< NF=10 PG=0 > : 3060
+< NF=11 PG=0 > : 816
+< NF=12 PG=0 > : 153
+< NF=13 PG=0 > : 18
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 23
+< NF=2 PG=0 > : 253
+< NF=3 PG=0 > : 1771
+< NF=4 PG=0 > : 8855
+< NF=5 PG=0 > : 24310
+< NF=6 PG=0 > : 24310
+< NF=7 PG=0 > : 19448
+< NF=8 PG=0 > : 12376
+< NF=9 PG=0 > : 6188
+< NF=10 PG=0 > : 2380
+< NF=11 PG=0 > : 680
+< NF=12 PG=0 > : 136
+< NF=13 PG=0 > : 17
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 24
+< NF=2 PG=0 > : 276
+< NF=3 PG=0 > : 2024
+< NF=4 PG=0 > : 8008
+< NF=5 PG=0 > : 11440
+< NF=6 PG=0 > : 12870
+< NF=7 PG=0 > : 11440
+< NF=8 PG=0 > : 8008
+< NF=9 PG=0 > : 4368
+< NF=10 PG=0 > : 1820
+< NF=11 PG=0 > : 560
+< NF=12 PG=0 > : 120
+< NF=13 PG=0 > : 16
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 25
+< NF=2 PG=0 > : 300
+< NF=3 PG=0 > : 1365
+< NF=4 PG=0 > : 3003
+< NF=5 PG=0 > : 5005
+< NF=6 PG=0 > : 6435
+< NF=7 PG=0 > : 6435
+< NF=8 PG=0 > : 5005
+< NF=9 PG=0 > : 3003
+< NF=10 PG=0 > : 1365
+< NF=11 PG=0 > : 455
+< NF=12 PG=0 > : 105
+< NF=13 PG=0 > : 15
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 14
+< NF=2 PG=0 > : 91
+< NF=3 PG=0 > : 364
+< NF=4 PG=0 > : 1001
+< NF=5 PG=0 > : 2002
+< NF=6 PG=0 > : 3003
+< NF=7 PG=0 > : 3432
+< NF=8 PG=0 > : 3003
+< NF=9 PG=0 > : 2002
+< NF=10 PG=0 > : 1001
+< NF=11 PG=0 > : 364
+< NF=12 PG=0 > : 91
+< NF=13 PG=0 > : 14
+< NF=14 PG=0 > : 1
+
+< NF=1 PG=0 > : 1
+< NF=2 PG=0 > : 13
+< NF=3 PG=0 > : 78
+< NF=4 PG=0 > : 286
+< NF=5 PG=0 > : 715
+< NF=6 PG=0 > : 1287
+< NF=7 PG=0 > : 1716
+< NF=8 PG=0 > : 1716
+< NF=9 PG=0 > : 1287
+< NF=10 PG=0 > : 715
+< NF=11 PG=0 > : 286
+< NF=12 PG=0 > : 78
+< NF=13 PG=0 > : 13
+< NF=14 PG=0 > : 1
+
+< NF=2 PG=0 > : 1
+< NF=3 PG=0 > : 12
+< NF=4 PG=0 > : 66
+< NF=5 PG=0 > : 220
+< NF=6 PG=0 > : 495
+< NF=7 PG=0 > : 792
+< NF=8 PG=0 > : 924
+< NF=9 PG=0 > : 792
+< NF=10 PG=0 > : 495
+< NF=11 PG=0 > : 220
+< NF=12 PG=0 > : 66
+< NF=13 PG=0 > : 12
+< NF=14 PG=0 > : 1
+
+< NF=3 PG=0 > : 1
+< NF=4 PG=0 > : 11
+< NF=5 PG=0 > : 55
+< NF=6 PG=0 > : 165
+< NF=7 PG=0 > : 330
+< NF=8 PG=0 > : 462
+< NF=9 PG=0 > : 462
+< NF=10 PG=0 > : 330
+< NF=11 PG=0 > : 165
+< NF=12 PG=0 > : 55
+< NF=13 PG=0 > : 11
+< NF=14 PG=0 > : 1
+
+< NF=4 PG=0 > : 1
+< NF=5 PG=0 > : 10
+< NF=6 PG=0 > : 45
+< NF=7 PG=0 > : 120
+< NF=8 PG=0 > : 210
+< NF=9 PG=0 > : 252
+< NF=10 PG=0 > : 210
+< NF=11 PG=0 > : 120
+< NF=12 PG=0 > : 45
+< NF=13 PG=0 > : 10
+< NF=14 PG=0 > : 1
+
+< NF=5 PG=0 > : 1
+< NF=6 PG=0 > : 9
+< NF=7 PG=0 > : 36
+< NF=8 PG=0 > : 84
+< NF=9 PG=0 > : 126
+< NF=10 PG=0 > : 126
+< NF=11 PG=0 > : 84
+< NF=12 PG=0 > : 36
+< NF=13 PG=0 > : 9
+< NF=14 PG=0 > : 1
+
+< NF=6 PG=0 > : 1
+< NF=7 PG=0 > : 8
+< NF=8 PG=0 > : 28
+< NF=9 PG=0 > : 56
+< NF=10 PG=0 > : 70
+< NF=11 PG=0 > : 56
+< NF=12 PG=0 > : 28
+< NF=13 PG=0 > : 8
+< NF=14 PG=0 > : 1
+
+< NF=7 PG=0 > : 1
+< NF=8 PG=0 > : 7
+< NF=9 PG=0 > : 21
+< NF=10 PG=0 > : 35
+< NF=11 PG=0 > : 35
+< NF=12 PG=0 > : 21
+< NF=13 PG=0 > : 7
+< NF=14 PG=0 > : 1
+
+< NF=8 PG=0 > : 1
+< NF=9 PG=0 > : 6
+< NF=10 PG=0 > : 15
+< NF=11 PG=0 > : 20
+< NF=12 PG=0 > : 15
+< NF=13 PG=0 > : 6
+< NF=14 PG=0 > : 1
+
+< NF=9 PG=0 > : 1
+< NF=10 PG=0 > : 5
+< NF=11 PG=0 > : 10
+< NF=12 PG=0 > : 10
+< NF=13 PG=0 > : 5
+< NF=14 PG=0 > : 1
+
+< NF=10 PG=0 > : 1
+< NF=11 PG=0 > : 4
+< NF=12 PG=0 > : 6
+< NF=13 PG=0 > : 4
+< NF=14 PG=0 > : 1
+
+< NF=11 PG=0 > : 1
+< NF=12 PG=0 > : 3
+< NF=13 PG=0 > : 3
+< NF=14 PG=0 > : 1
+
+< NF=12 PG=0 > : 1
+< NF=13 PG=0 > : 2
+< NF=14 PG=0 > : 1
+
+< NF=13 PG=0 > : 1
+< NF=14 PG=0 > : 1
+
+< NF=14 PG=0 > : 1
+
+org mps_info right_dims_fci
+< NF=14 PG=0 > : 1
+
+< NF=13 PG=0 > : 1
+< NF=14 PG=0 > : 1
+
+< NF=12 PG=0 > : 1
+< NF=13 PG=0 > : 2
+< NF=14 PG=0 > : 1
+
+< NF=11 PG=0 > : 1
+< NF=12 PG=0 > : 3
+< NF=13 PG=0 > : 3
+< NF=14 PG=0 > : 1
+
+< NF=10 PG=0 > : 1
+< NF=11 PG=0 > : 4
+< NF=12 PG=0 > : 6
+< NF=13 PG=0 > : 4
+< NF=14 PG=0 > : 1
+
+< NF=9 PG=0 > : 1
+< NF=10 PG=0 > : 5
+< NF=11 PG=0 > : 10
+< NF=12 PG=0 > : 10
+< NF=13 PG=0 > : 5
+< NF=14 PG=0 > : 1
+
+< NF=8 PG=0 > : 1
+< NF=9 PG=0 > : 6
+< NF=10 PG=0 > : 15
+< NF=11 PG=0 > : 20
+< NF=12 PG=0 > : 15
+< NF=13 PG=0 > : 6
+< NF=14 PG=0 > : 1
+
+< NF=7 PG=0 > : 1
+< NF=8 PG=0 > : 7
+< NF=9 PG=0 > : 21
+< NF=10 PG=0 > : 35
+< NF=11 PG=0 > : 35
+< NF=12 PG=0 > : 21
+< NF=13 PG=0 > : 7
+< NF=14 PG=0 > : 1
+
+< NF=6 PG=0 > : 1
+< NF=7 PG=0 > : 8
+< NF=8 PG=0 > : 28
+< NF=9 PG=0 > : 56
+< NF=10 PG=0 > : 70
+< NF=11 PG=0 > : 56
+< NF=12 PG=0 > : 28
+< NF=13 PG=0 > : 8
+< NF=14 PG=0 > : 1
+
+< NF=5 PG=0 > : 1
+< NF=6 PG=0 > : 9
+< NF=7 PG=0 > : 36
+< NF=8 PG=0 > : 84
+< NF=9 PG=0 > : 126
+< NF=10 PG=0 > : 126
+< NF=11 PG=0 > : 84
+< NF=12 PG=0 > : 36
+< NF=13 PG=0 > : 9
+< NF=14 PG=0 > : 1
+
+< NF=4 PG=0 > : 1
+< NF=5 PG=0 > : 10
+< NF=6 PG=0 > : 45
+< NF=7 PG=0 > : 120
+< NF=8 PG=0 > : 210
+< NF=9 PG=0 > : 252
+< NF=10 PG=0 > : 210
+< NF=11 PG=0 > : 120
+< NF=12 PG=0 > : 45
+< NF=13 PG=0 > : 10
+< NF=14 PG=0 > : 1
+
+< NF=3 PG=0 > : 1
+< NF=4 PG=0 > : 11
+< NF=5 PG=0 > : 55
+< NF=6 PG=0 > : 165
+< NF=7 PG=0 > : 330
+< NF=8 PG=0 > : 462
+< NF=9 PG=0 > : 462
+< NF=10 PG=0 > : 330
+< NF=11 PG=0 > : 165
+< NF=12 PG=0 > : 55
+< NF=13 PG=0 > : 11
+< NF=14 PG=0 > : 1
+
+< NF=2 PG=0 > : 1
+< NF=3 PG=0 > : 12
+< NF=4 PG=0 > : 66
+< NF=5 PG=0 > : 220
+< NF=6 PG=0 > : 495
+< NF=7 PG=0 > : 792
+< NF=8 PG=0 > : 924
+< NF=9 PG=0 > : 792
+< NF=10 PG=0 > : 495
+< NF=11 PG=0 > : 220
+< NF=12 PG=0 > : 66
+< NF=13 PG=0 > : 12
+< NF=14 PG=0 > : 1
+
+< NF=1 PG=0 > : 1
+< NF=2 PG=0 > : 13
+< NF=3 PG=0 > : 78
+< NF=4 PG=0 > : 286
+< NF=5 PG=0 > : 715
+< NF=6 PG=0 > : 1287
+< NF=7 PG=0 > : 1716
+< NF=8 PG=0 > : 1716
+< NF=9 PG=0 > : 1287
+< NF=10 PG=0 > : 715
+< NF=11 PG=0 > : 286
+< NF=12 PG=0 > : 78
+< NF=13 PG=0 > : 13
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 14
+< NF=2 PG=0 > : 91
+< NF=3 PG=0 > : 364
+< NF=4 PG=0 > : 1001
+< NF=5 PG=0 > : 2002
+< NF=6 PG=0 > : 3003
+< NF=7 PG=0 > : 3432
+< NF=8 PG=0 > : 3003
+< NF=9 PG=0 > : 2002
+< NF=10 PG=0 > : 1001
+< NF=11 PG=0 > : 364
+< NF=12 PG=0 > : 91
+< NF=13 PG=0 > : 14
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 25
+< NF=2 PG=0 > : 300
+< NF=3 PG=0 > : 1365
+< NF=4 PG=0 > : 3003
+< NF=5 PG=0 > : 5005
+< NF=6 PG=0 > : 6435
+< NF=7 PG=0 > : 6435
+< NF=8 PG=0 > : 5005
+< NF=9 PG=0 > : 3003
+< NF=10 PG=0 > : 1365
+< NF=11 PG=0 > : 455
+< NF=12 PG=0 > : 105
+< NF=13 PG=0 > : 15
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 24
+< NF=2 PG=0 > : 276
+< NF=3 PG=0 > : 2024
+< NF=4 PG=0 > : 8008
+< NF=5 PG=0 > : 11440
+< NF=6 PG=0 > : 12870
+< NF=7 PG=0 > : 11440
+< NF=8 PG=0 > : 8008
+< NF=9 PG=0 > : 4368
+< NF=10 PG=0 > : 1820
+< NF=11 PG=0 > : 560
+< NF=12 PG=0 > : 120
+< NF=13 PG=0 > : 16
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 23
+< NF=2 PG=0 > : 253
+< NF=3 PG=0 > : 1771
+< NF=4 PG=0 > : 8855
+< NF=5 PG=0 > : 24310
+< NF=6 PG=0 > : 24310
+< NF=7 PG=0 > : 19448
+< NF=8 PG=0 > : 12376
+< NF=9 PG=0 > : 6188
+< NF=10 PG=0 > : 2380
+< NF=11 PG=0 > : 680
+< NF=12 PG=0 > : 136
+< NF=13 PG=0 > : 17
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 22
+< NF=2 PG=0 > : 231
+< NF=3 PG=0 > : 1540
+< NF=4 PG=0 > : 7315
+< NF=5 PG=0 > : 26334
+< NF=6 PG=0 > : 43758
+< NF=7 PG=0 > : 31824
+< NF=8 PG=0 > : 18564
+< NF=9 PG=0 > : 8568
+< NF=10 PG=0 > : 3060
+< NF=11 PG=0 > : 816
+< NF=12 PG=0 > : 153
+< NF=13 PG=0 > : 18
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 21
+< NF=2 PG=0 > : 210
+< NF=3 PG=0 > : 1330
+< NF=4 PG=0 > : 5985
+< NF=5 PG=0 > : 20349
+< NF=6 PG=0 > : 54264
+< NF=7 PG=0 > : 50388
+< NF=8 PG=0 > : 27132
+< NF=9 PG=0 > : 11628
+< NF=10 PG=0 > : 3876
+< NF=11 PG=0 > : 969
+< NF=12 PG=0 > : 171
+< NF=13 PG=0 > : 19
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 20
+< NF=2 PG=0 > : 190
+< NF=3 PG=0 > : 1140
+< NF=4 PG=0 > : 4845
+< NF=5 PG=0 > : 15504
+< NF=6 PG=0 > : 38760
+< NF=7 PG=0 > : 77520
+< NF=8 PG=0 > : 38760
+< NF=9 PG=0 > : 15504
+< NF=10 PG=0 > : 4845
+< NF=11 PG=0 > : 1140
+< NF=12 PG=0 > : 190
+< NF=13 PG=0 > : 20
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 19
+< NF=2 PG=0 > : 171
+< NF=3 PG=0 > : 969
+< NF=4 PG=0 > : 3876
+< NF=5 PG=0 > : 11628
+< NF=6 PG=0 > : 27132
+< NF=7 PG=0 > : 50388
+< NF=8 PG=0 > : 54264
+< NF=9 PG=0 > : 20349
+< NF=10 PG=0 > : 5985
+< NF=11 PG=0 > : 1330
+< NF=12 PG=0 > : 210
+< NF=13 PG=0 > : 21
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 18
+< NF=2 PG=0 > : 153
+< NF=3 PG=0 > : 816
+< NF=4 PG=0 > : 3060
+< NF=5 PG=0 > : 8568
+< NF=6 PG=0 > : 18564
+< NF=7 PG=0 > : 31824
+< NF=8 PG=0 > : 43758
+< NF=9 PG=0 > : 26334
+< NF=10 PG=0 > : 7315
+< NF=11 PG=0 > : 1540
+< NF=12 PG=0 > : 231
+< NF=13 PG=0 > : 22
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 17
+< NF=2 PG=0 > : 136
+< NF=3 PG=0 > : 680
+< NF=4 PG=0 > : 2380
+< NF=5 PG=0 > : 6188
+< NF=6 PG=0 > : 12376
+< NF=7 PG=0 > : 19448
+< NF=8 PG=0 > : 24310
+< NF=9 PG=0 > : 24310
+< NF=10 PG=0 > : 8855
+< NF=11 PG=0 > : 1771
+< NF=12 PG=0 > : 253
+< NF=13 PG=0 > : 23
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 16
+< NF=2 PG=0 > : 120
+< NF=3 PG=0 > : 560
+< NF=4 PG=0 > : 1820
+< NF=5 PG=0 > : 4368
+< NF=6 PG=0 > : 8008
+< NF=7 PG=0 > : 11440
+< NF=8 PG=0 > : 12870
+< NF=9 PG=0 > : 11440
+< NF=10 PG=0 > : 8008
+< NF=11 PG=0 > : 2024
+< NF=12 PG=0 > : 276
+< NF=13 PG=0 > : 24
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 15
+< NF=2 PG=0 > : 105
+< NF=3 PG=0 > : 455
+< NF=4 PG=0 > : 1365
+< NF=5 PG=0 > : 3003
+< NF=6 PG=0 > : 5005
+< NF=7 PG=0 > : 6435
+< NF=8 PG=0 > : 6435
+< NF=9 PG=0 > : 5005
+< NF=10 PG=0 > : 3003
+< NF=11 PG=0 > : 1365
+< NF=12 PG=0 > : 300
+< NF=13 PG=0 > : 25
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 14
+< NF=2 PG=0 > : 91
+< NF=3 PG=0 > : 364
+< NF=4 PG=0 > : 1001
+< NF=5 PG=0 > : 2002
+< NF=6 PG=0 > : 3003
+< NF=7 PG=0 > : 3432
+< NF=8 PG=0 > : 3003
+< NF=9 PG=0 > : 2002
+< NF=10 PG=0 > : 1001
+< NF=11 PG=0 > : 364
+< NF=12 PG=0 > : 91
+< NF=13 PG=0 > : 14
+< NF=14 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 13
+< NF=2 PG=0 > : 78
+< NF=3 PG=0 > : 286
+< NF=4 PG=0 > : 715
+< NF=5 PG=0 > : 1287
+< NF=6 PG=0 > : 1716
+< NF=7 PG=0 > : 1716
+< NF=8 PG=0 > : 1287
+< NF=9 PG=0 > : 715
+< NF=10 PG=0 > : 286
+< NF=11 PG=0 > : 78
+< NF=12 PG=0 > : 13
+< NF=13 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 12
+< NF=2 PG=0 > : 66
+< NF=3 PG=0 > : 220
+< NF=4 PG=0 > : 495
+< NF=5 PG=0 > : 792
+< NF=6 PG=0 > : 924
+< NF=7 PG=0 > : 792
+< NF=8 PG=0 > : 495
+< NF=9 PG=0 > : 220
+< NF=10 PG=0 > : 66
+< NF=11 PG=0 > : 12
+< NF=12 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 11
+< NF=2 PG=0 > : 55
+< NF=3 PG=0 > : 165
+< NF=4 PG=0 > : 330
+< NF=5 PG=0 > : 462
+< NF=6 PG=0 > : 462
+< NF=7 PG=0 > : 330
+< NF=8 PG=0 > : 165
+< NF=9 PG=0 > : 55
+< NF=10 PG=0 > : 11
+< NF=11 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 10
+< NF=2 PG=0 > : 45
+< NF=3 PG=0 > : 120
+< NF=4 PG=0 > : 210
+< NF=5 PG=0 > : 252
+< NF=6 PG=0 > : 210
+< NF=7 PG=0 > : 120
+< NF=8 PG=0 > : 45
+< NF=9 PG=0 > : 10
+< NF=10 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 9
+< NF=2 PG=0 > : 36
+< NF=3 PG=0 > : 84
+< NF=4 PG=0 > : 126
+< NF=5 PG=0 > : 126
+< NF=6 PG=0 > : 84
+< NF=7 PG=0 > : 36
+< NF=8 PG=0 > : 9
+< NF=9 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 8
+< NF=2 PG=0 > : 28
+< NF=3 PG=0 > : 56
+< NF=4 PG=0 > : 70
+< NF=5 PG=0 > : 56
+< NF=6 PG=0 > : 28
+< NF=7 PG=0 > : 8
+< NF=8 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 7
+< NF=2 PG=0 > : 21
+< NF=3 PG=0 > : 35
+< NF=4 PG=0 > : 35
+< NF=5 PG=0 > : 21
+< NF=6 PG=0 > : 7
+< NF=7 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 6
+< NF=2 PG=0 > : 15
+< NF=3 PG=0 > : 20
+< NF=4 PG=0 > : 15
+< NF=5 PG=0 > : 6
+< NF=6 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 5
+< NF=2 PG=0 > : 10
+< NF=3 PG=0 > : 10
+< NF=4 PG=0 > : 5
+< NF=5 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 4
+< NF=2 PG=0 > : 6
+< NF=3 PG=0 > : 4
+< NF=4 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 3
+< NF=2 PG=0 > : 3
+< NF=3 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 2
+< NF=2 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+< NF=1 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+
+mrci mps_info left_dims_fci
+< NF=0 PG=0 > : 1
+
+< NF=1 PG=0 > : 1
+
+< NF=2 PG=0 > : 1
+
+< NF=3 PG=0 > : 1
+
+< NF=4 PG=0 > : 1
+
+< NF=5 PG=0 > : 1
+
+< NF=6 PG=0 > : 1
+
+< NF=7 PG=0 > : 1
+
+< NF=8 PG=0 > : 1
+
+< NF=9 PG=0 > : 1
+
+< NF=10 PG=0 > : 1
+
+< NF=11 PG=0 > : 1
+
+< NF=12 PG=0 > : 1
+
+< NF=13 PG=0 > : 1
+
+< NF=14 PG=0 > : 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+mrci mps_info right_dims_fci
+< NF=14 PG=0 > : 1
+
+< NF=13 PG=0 > : 1
+
+< NF=12 PG=0 > : 1
+
+< NF=11 PG=0 > : 1
+
+< NF=10 PG=0 > : 1
+
+< NF=9 PG=0 > : 1
+
+< NF=8 PG=0 > : 1
+
+< NF=7 PG=0 > : 1
+
+< NF=6 PG=0 > : 1
+
+< NF=5 PG=0 > : 1
+
+< NF=4 PG=0 > : 1
+
+< NF=3 PG=0 > : 1
+
+< NF=2 PG=0 > : 1
+
+< NF=1 PG=0 > : 1
+
+< NF=0 PG=0 > : 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+< NF=0 PG=0 > : 1
+
+Environment initialization | Nsites =    40 | Center =     0
+ INIT-R <-- Site =   37 ..  Bmem =     0 B Rmem =     0 B T = 0.02
+ INIT-R <-- Site =   36 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   35 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   34 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   33 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   32 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   31 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   30 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   29 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   28 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   27 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =   26 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   25 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   24 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   23 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   22 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   21 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   20 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   19 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   18 ..  Bmem =     0 B Rmem =     0 B T = 0.05
+ INIT-R <-- Site =   17 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   16 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   15 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   14 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   13 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   12 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   11 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =   10 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =    9 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =    8 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    7 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =    6 ..  Bmem =     0 B Rmem =     0 B T = 0.01
+ INIT-R <-- Site =    5 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    4 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    3 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    2 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    1 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+ INIT-R <-- Site =    0 ..  Bmem =     0 B Rmem =     0 B T = 0.00
+Time init sweep =        0.263 | MaxBmem =     0 B | MaxRmem =     0 B
+ | Tread = 0.000 | Twrite = 0.060 | Tfpread = 0.000 | Tfpwrite = 0.001 | data = 0 B | cpsd = 0 B | Tasync = 0.000
+
+
+Sweep =    0 | Direction =  forward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-06
+ --> Site =    0-   1 .. Cannot generate initial guess 0 for Davidson unitary to all given states!
