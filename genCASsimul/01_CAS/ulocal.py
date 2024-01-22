@@ -1,12 +1,13 @@
 #
 # Localization based on ALPHA orbitals from UHF/UKS check files
 #
+
 import numpy
 import scipy.linalg
 from pyscf import tools,gto,scf,dft
 import h5py
 from pyscf.tools import molden
-
+from functools import reduce # FIXME
 def sqrtm(s):
    e, v = numpy.linalg.eigh(s)
    return numpy.dot(v*numpy.sqrt(e), v.T.conj())
@@ -28,12 +29,12 @@ def psort(ova,fav,pT,coeff):
    return ncoeff,nocc,enorb
 
 def lowdinPop(mol,coeff,ova,enorb,occ):
-   print '\nLowdin population for LMOs:'
+   print ('\nLowdin population for LMOs:')
    nb,nc = coeff.shape
    s12 = sqrtm(ova)
    lcoeff = s12.dot(coeff)
    diff = reduce(numpy.dot,(lcoeff.T,lcoeff)) - numpy.identity(nc)
-   print 'diff=',numpy.linalg.norm(diff)
+   print ('diff=',numpy.linalg.norm(diff))
    pthresh = 0.05
    labels = mol.spheric_labels()
    nelec = 0.0
@@ -41,11 +42,11 @@ def lowdinPop(mol,coeff,ova,enorb,occ):
       vec = lcoeff[:,iorb]**2
       #idx = list(numpy.argwhere(vec>pthresh))
       idx= numpy.where(vec == numpy.amax(vec))[0]
-      print ' iorb=',iorb,' occ=',occ[iorb],' <i|F|i>=',enorb[iorb]
+      print (' iorb=',iorb,' occ=',occ[iorb],' <i|F|i>=',enorb[iorb])
       for iao in idx:
-         print '    iao=',labels[iao],' pop=',vec[iao]
+         print ('    iao=',labels[iao],' pop=',vec[iao])
       nelec += occ[iorb]
-   print 'nelec=',nelec
+   print ('nelec=',nelec)
    return 0
 
 def scdm(coeff,ova,aux):
@@ -60,11 +61,11 @@ def scdm(coeff,ova,aux):
    return cnew
 
 def dumpLMO(mol,fname,lmo):
-   print 'Dump into '+fname+'.h5'
+   print ('Dump into '+fname+'.h5')
    f = h5py.File(fname+'.h5','w')
    f.create_dataset("lmo",data=lmo)
    f.close()
-   print 'Dump into '+fname+'_lmo.molden'
+   print ('Dump into '+fname+'_lmo.molden')
    with open(fname+'_lmo.molden','w') as thefile:
        molden.header(mol,thefile)
        molden.orbital_coeff(mol,thefile,lmo)
@@ -84,8 +85,8 @@ def dumpLocal(fname):
    nb = mo_coeff.shape[1]
    nalpha = (mol.nelectron+mol.spin)/2
    nbeta  = (mol.nelectron-mol.spin)/2
-   print 'nalpha,nbeta,mol.spin,nb:',\
-          nalpha,nbeta,mol.spin,nb
+   print ('nalpha,nbeta,mol.spin,nb:',\
+          nalpha,nbeta,mol.spin,nb)
    # UHF-alpha/beta
    ma = mo_coeff[0]
    mb = mo_coeff[1]
@@ -122,11 +123,11 @@ def dumpLocal(fname):
    #---Check---
    tij = reduce(numpy.dot,(mc.T,ova,ma_c))
    sig = scipy.linalg.svd(tij,compute_uv=False)
-   print 'nc=',nalpha,numpy.sum(sig**2)
+   print ('nc=',nalpha,numpy.sum(sig**2))
    assert abs(nalpha-numpy.sum(sig**2))<1.e-8
    tij = reduce(numpy.dot,(mv.T,ova,ma_v))
    sig = scipy.linalg.svd(tij,compute_uv=False)
-   print 'nv=',nb-nalpha,numpy.sum(sig**2)
+   print ('nv=',nb-nalpha,numpy.sum(sig**2))
    assert abs(nb-nalpha-numpy.sum(sig**2))<1.e-8
 
    lmo = numpy.hstack([mc,mv])
@@ -134,8 +135,8 @@ def dumpLocal(fname):
    occ = numpy.hstack([occ_c,occ_v])
    lowdinPop(mol,lmo,ova,enorb,occ)
    dumpLMO(mol,fname,lmo)
-   print 'nalpha,nbeta,mol.spin,nb:',\
-          nalpha,nbeta,mol.spin,nb
+   print ('nalpha,nbeta,mol.spin,nb:',\
+          nalpha,nbeta,mol.spin,nb)
    return 0
 
 if __name__ == '__main__':   

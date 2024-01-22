@@ -54,12 +54,12 @@ def loc(mol,mocoeff,tol=1.e-6,maxcycle=1000,iop=0):
 
 def loc_kernel(mol,mocoeff,ova,partition,tol,maxcycle,iop):
    debug = False
-   print
-   print '[pm_loc_kernel]'
-   print ' mocoeff.shape=',mocoeff.shape
-   print ' tol=',tol
-   print ' maxcycle=',maxcycle
-   print ' partition=',len(partition),'\n',partition
+   print ()
+   print ('[pm_loc_kernel]')
+   print (' mocoeff.shape=',mocoeff.shape)
+   print (' tol=',tol)
+   print (' maxcycle=',maxcycle)
+   print (' partition=',len(partition),'\n',partition)
    k = mocoeff.shape[0]
    n = mocoeff.shape[1]
    natom = len(partition)
@@ -83,13 +83,13 @@ def loc_kernel(mol,mocoeff,ova,partition,tol,maxcycle,iop):
          pija = numpy.zeros((natom,n,n))
          for iatom in range(natom):
             idx = partition[iatom]
-	    pija[iatom] = numpy.dot(s12c[idx,:].T,s12c[idx,:])
+            pija[iatom] = numpy.dot(s12c[idx,:].T,s12c[idx,:])
       # Boys
       elif iop == 2:
-	 rmat = mol.intor_symmetric('cint1e_r_sph',3)
-	 pija = numpy.zeros((3,n,n))
-	 for icart in range(3):
-	    pija[icart] = reduce(numpy.dot,(c.T,rmat[icart],c))
+         rmat = mol.intor_symmetric('cint1e_r_sph',3)
+         pija = numpy.zeros((3,n,n))
+         for icart in range(3):
+            pija[icart] = reduce(numpy.dot,(c.T,rmat[icart],c))
       # P[i,j,a]
       pija = pija.transpose(1,2,0).copy()
       return pija
@@ -109,7 +109,7 @@ def loc_kernel(mol,mocoeff,ova,partition,tol,maxcycle,iop):
       return numpy.einsum('iia,iia',pija,pija)
 
    fun = funval(pija)
-   print ' initial funval = ',fun
+   print (' initial funval = ',fun)
    #
    # Iteration
    #
@@ -119,8 +119,8 @@ def loc_kernel(mol,mocoeff,ova,partition,tol,maxcycle,iop):
       ijdx = []
       for i in range(n-1):
          for j in range(i+1,n):
-	    bij = abs(numpy.sum(pija[i,j]*(pija[i,i]-pija[j,j])))
-	    ijdx.append((i,j,bij))
+            bij = abs(numpy.sum(pija[i,j]*(pija[i,i]-pija[j,j])))
+            ijdx.append((i,j,bij))
       # Without pivoting
       #   6-31g: icycle= 184 delta= 5.6152945523e-09 fun= 54.4719738182
       #   avtz : icycle= 227 delta= 4.43639097128e-09 fun= 3907.60402435
@@ -133,82 +133,81 @@ def loc_kernel(mol,mocoeff,ova,partition,tol,maxcycle,iop):
 	 #
 	 # determine angle
 	 #
-	 vij = pija[i,i]-pija[j,j] 
-	 aij = numpy.dot(pija[i,j],pija[i,j]) \
-	     - 0.25*numpy.dot(vij,vij)
-	 bij = numpy.dot(pija[i,j],vij)
-	 if abs(aij)<1.e-10 and abs(bij)<1.e-10: continue
-	 p1 = math.sqrt(aij**2+bij**2)
-	 cos4a = -aij/p1
-	 sin4a = bij/p1
-	 cos2a = math.sqrt((1+cos4a)*0.5)
-	 sin2a = math.sqrt((1-cos4a)*0.5)
-	 cosa  = math.sqrt((1+cos2a)*0.5)
-	 sina  = math.sqrt((1-cos2a)*0.5)
+         vij = pija[i,i]-pija[j,j]
+         aij = numpy.dot(pija[i,j],pija[i,j]) \
+             - 0.25*numpy.dot(vij,vij)
+         bij = numpy.dot(pija[i,j],vij)
+         if abs(aij)<1.e-10 and abs(bij)<1.e-10: continue
+         p1 = math.sqrt(aij**2+bij**2)
+         cos4a = -aij/p1
+         sin4a = bij/p1
+         cos2a = math.sqrt((1+cos4a)*0.5)
+         sin2a = math.sqrt((1-cos4a)*0.5)
+         cosa  = math.sqrt((1+cos2a)*0.5)
+         sina  = math.sqrt((1-cos2a)*0.5)
 	 # Why? Because we require alpha in [0,pi/2]
-	 if sin4a < 0.0:
-	    cos2a = -cos2a
-	    sina,cosa = cosa,sina
+         if sin4a < 0.0:
+            cos2a = -cos2a
+            sina,cosa = cosa,sina
 	 # stationary condition
-	 if abs(cosa-1.0)<1.e-10: continue
-	 if abs(sina-1.0)<1.e-10: continue
-	 # incremental value
-	 delta += p1*(1-cos4a)
-	 # 
-	 # Transformation
-	 #
-	 if debug:
-	    g = numpy.identity(n)
-	    g[i,i] = cosa
-	    g[j,j] = cosa
-	    g[i,j] = -sina
-	    g[j,i] = sina
-	    ug = u.dot(g)
-	    pijag = numpy.einsum('ik,jl,ija->kla',ug,ug,pija0)
-	 # Urot
-	 ui = u[:,i]*cosa+u[:,j]*sina
-	 uj = -u[:,i]*sina+u[:,j]*cosa
-	 u[:,i] = ui.copy() 
-	 u[:,j] = uj.copy()
-	 # Bra-transformation of Integrals
-	 tmp_ip = pija[i,:,:]*cosa+pija[j,:,:]*sina
-	 tmp_jp = -pija[i,:,:]*sina+pija[j,:,:]*cosa
- 	 pija[i,:,:] = tmp_ip.copy() 
- 	 pija[j,:,:] = tmp_jp.copy()
-	 # Ket-transformation of Integrals
-	 tmp_ip = pija[:,i,:]*cosa+pija[:,j,:]*sina
-	 tmp_jp = -pija[:,i,:]*sina+pija[:,j,:]*cosa
- 	 pija[:,i,:] = tmp_ip.copy()
- 	 pija[:,j,:] = tmp_jp.copy()
+         if abs(cosa-1.0)<1.e-10: continue
+         if abs(sina-1.0)<1.e-10: continue
+         # incremental value
+         delta += p1*(1-cos4a)
+         # 
+         # Transformation
+         #
          if debug:
-	    diff1 = numpy.linalg.norm(u-ug)
-	    diff2 = numpy.linalg.norm(pija-pijag)
+            g = numpy.identity(n)
+            g[i,i] = cosa
+            g[j,j] = cosa
+            g[i,j] = -sina
+            g[j,i] = sina
+            ug = u.dot(g)
+            pijag = numpy.einsum('ik,jl,ija->kla',ug,ug,pija0)
+         # Urot
+         ui = u[:,i]*cosa+u[:,j]*sina
+         uj = -u[:,i]*sina+u[:,j]*cosa
+         u[:,i] = ui.copy() 
+         u[:,j] = uj.copy()
+         # Bra-transformation of Integrals
+         tmp_ip = pija[i,:,:]*cosa+pija[j,:,:]*sina
+         tmp_jp = -pija[i,:,:]*sina+pija[j,:,:]*cosa
+         pija[i,:,:] = tmp_ip.copy() 
+         pija[j,:,:] = tmp_jp.copy()
+         # Ket-transformation of Integrals
+         tmp_ip = pija[:,i,:]*cosa+pija[:,j,:]*sina
+         tmp_jp = -pija[:,i,:]*sina+pija[:,j,:]*cosa
+         pija[:,i,:] = tmp_ip.copy()
+         pija[:,j,:] = tmp_jp.copy()
+         if debug:
+            diff1 = numpy.linalg.norm(u-ug)
+            diff2 = numpy.linalg.norm(pija-pijag)
             cu = numpy.dot(mocoeff,u)
             pija2 = genPaij(cu,ova,partition)
             fun2 = funval(pija2)
             diff = abs(fun+delta-fun2)
-	    print 'diff(u/p/f)=',diff1,diff2,diff
-	    if diff1>1.e-6:
-	       print 'Error: ug',diff1
-	       exit()
-	    if diff2>1.e-6:
-	       print 'Error: pijag',diff2
-	       exit()
-            if diff>1.e-6: 
-               print 'Error: inconsistency in PMloc: fun/fun2=',fun+delta,fun2
+            print ('diff(u/p/f)=',diff1,diff2,diff)
+            if diff1>1.e-6:
+               print ('Error: ug',diff1)
                exit()
-
+            if diff2>1.e-6:
+               print ('Error: pijag',diff2)
+               exit()
+            if diff>1.e-6: 
+               print ('Error: inconsistency in PMloc: fun/fun2=',fun+delta,fun2)
+               exit()
       fun = fun+delta
-      print 'icycle=',icycle,'delta=',delta,'fun=',fun
+      print ('icycle=',icycle,'delta=',delta,'fun=',fun)
       if delta<tol: break
    
    # Check 
    ierr = 0
    if delta<tol: 
-      print 'CONG: PMloc converged!'
+      print ('CONG: PMloc converged!')
    else:
       ierr=1
-      print 'WARNING: PMloc not converged'
+      print ('WARNING: PMloc not converged')
    return ierr,u
 
 def genAtomPartition(mol):
@@ -233,7 +232,7 @@ def genAtomPartition(mol):
 #
 
 if __name__ == '__main__':
-  print 'PMlocal'
+  print ('PMlocal')
   
   from pyscf import gto,scf
   mol = gto.Mole()
