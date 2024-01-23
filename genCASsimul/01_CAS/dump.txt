@@ -1,5 +1,0 @@
-var ic=0
-for (var i = 71; i < 100; i++ ){
-   ic=ic+1
-   print "isosurface resolution 5 MO "+i+';write IMAGE 2400 1600 JPG 100 "fes'+i+'.jpg"'
-}
